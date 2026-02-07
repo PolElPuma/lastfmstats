@@ -1009,7 +1009,9 @@ class ScrobblesAnalyzer:
         summary: Optional[Dict[str, Any]] = None,
         n_items: int = 20,
         n_days: int = 5,
-        n_peak_plays: int = 5
+        n_peak_plays: int = 5,
+        split_by_year: bool = False,
+        cards_per_page: int = 120
     ) -> None:
         """
         Genera un archivo HTML con un calendario visual de las canciones más escuchadas
@@ -1017,10 +1019,11 @@ class ScrobblesAnalyzer:
         Args:
             scrobbles: Lista de scrobbles
             output_file: Ruta del archivo HTML de salida
-            summary: Diccionario con datos de resumen
+            summary: Diccionario con datos de resumen (o dict de años si split_by_year=True)
             n_items: Número de canciones/artistas/álbumes a mostrar
             n_days: Número de días top a mostrar
             n_peak_plays: Número de canciones con mayor pico a mostrar
+            split_by_year: Si True, agrupa análisis por año
         """
         track_per_day = ScrobblesAnalyzer.get_most_played_track_per_day(scrobbles)
         
@@ -1028,22 +1031,48 @@ class ScrobblesAnalyzer:
             print("No hay datos para generar calendario")
             return
 
-        # Usar solo las URLs disponibles en los scrobbles (no hay búsquedas externas)
+        # Agrupar track_per_day por año
+        track_by_year: Dict[int, Dict[str, Any]] = defaultdict(dict)
+        for date_str, info in (track_per_day or {}).items():
+            try:
+                dt = datetime.strptime(date_str, "%d %b %Y")
+                year = dt.year
+            except Exception:
+                year = 0
+            track_by_year[year][date_str] = info
         
-        # Preparar datos serializados para JS
-        # Agregar parámetros de configuración al resumen
-        summary_with_config = (summary or {}).copy()
+        # Determinar si summary es por años o global
+        summary_is_by_year = split_by_year and summary and isinstance(summary, dict) and \
+                           all(isinstance(v, dict) and 'top_tracks' in v for v in (list(summary.values())[:1]))
+        
+        if summary_is_by_year:
+            # summary es {2021: {...stats...}, 2022: {...stats...}, ...}
+            summary_by_year = summary
+            # Para usar en el summary global (si es necesario), tomar el primer año
+            summary_with_config = (summary_by_year.get(max(summary_by_year.keys())) or {}).copy() if summary_by_year else {}
+        else:
+            # summary es un dict normal de stats
+            summary_with_config = (summary or {}).copy()
+            summary_by_year = {}
+        
         summary_with_config['_config'] = {
             'n_items': n_items,
             'n_days': n_days,
-            'n_peak_plays': n_peak_plays
+            'n_peak_plays': n_peak_plays,
+            'split_by_year': split_by_year,
+            'cards_per_page': cards_per_page
         }
+        
         # Incluir datos por hora si no están en el resumen
         if 'hourly_top' not in summary_with_config:
             summary_with_config['hourly_top'] = ScrobblesAnalyzer.get_hourly_top(scrobbles) or {}
         
         track_json = json.dumps(track_per_day, ensure_ascii=False)
+        track_by_year_json = json.dumps(track_by_year, ensure_ascii=False)
         summary_json = json.dumps(summary_with_config, ensure_ascii=False)
+        
+        # Serializar summary por años si están disponibles
+        summary_by_year_json = json.dumps(summary_by_year, ensure_ascii=False) if summary_by_year else "{}"
 
         # Crear HTML
         html = """<!DOCTYPE html>
@@ -1331,336 +1360,231 @@ class ScrobblesAnalyzer:
     
     <script>
         const trackPerDay = """ + track_json + """;
-        const summaryData = """ + summary_json + """;
-        
+        const trackByYear = """ + track_by_year_json + """;
+        let summaryData = """ + summary_json + """;
+        const summaryByYear = """ + summary_by_year_json + """;
+
         function openModal(date, artist, track, imageUrl, url, plays) {
             document.getElementById('modalDate').textContent = date;
             document.getElementById('modalArtist').textContent = artist;
             document.getElementById('modalTrack').textContent = track;
             document.getElementById('modalPlays').textContent = plays + ' escuchas';
-                let modalImg = document.getElementById('modalImage');
-                modalImg.src = imageUrl || '';
-                if (!imageUrl) {
-                    modalImg.alt = 'Sin imagen disponible';
-                }
-            document.getElementById('modalLink').href = url;
+            const modalImg = document.getElementById('modalImage');
+            modalImg.src = imageUrl || '';
+            document.getElementById('modalLink').href = url || '#';
             document.getElementById('modal').classList.add('show');
         }
-        
+
         function closeModal() {
             document.getElementById('modal').classList.remove('show');
         }
-        
-        function renderCalendar() {
-            let calendar = document.getElementById('calendar');
-            let totalDays = 0;
-            let totalPlays = 0;
-            
-            // Convertir string a objeto si es necesario
-            let data = """ + track_json + """;
-            
-            for (let [date, info] of Object.entries(data)) {
-                let [artist, track, imageUrl, url, plays] = info;
-                totalDays++;
-                totalPlays += plays;
 
-                let card = document.createElement('div');
-                card.className = 'day-card';
+        function renderCalendarFromData(data) {
+            const calendar = document.getElementById('calendar');
+            calendar.innerHTML = '';
+            const dates = Object.keys(data).sort((a,b)=> new Date(b.split(' ').reverse().join(' ')) - new Date(a.split(' ').reverse().join(' ')));
+            let totalDays = 0, totalPlays = 0;
+            for (let date of dates) {
+                const info = data[date];
+                if (!info) continue;
+                const [artist, track, imageUrl, url, plays] = info;
+                totalDays++; totalPlays += plays || 0;
 
-                let googleSearchUrl = 'https://www.google.com/search?q=' + encodeURIComponent(artist + ' ' + track) + '&tbm=isch';
-
-                // Imagen - creación por DOM para evitar errores de quoting en HTML
-                let imgWrapper = document.createElement('div');
+                const card = document.createElement('div'); card.className = 'day-card';
+                const googleSearchUrl = 'https://www.google.com/search?q=' + encodeURIComponent(artist + ' ' + track) + '&tbm=isch';
+                const imgWrapper = document.createElement('div');
                 if (imageUrl) {
-                    let img = document.createElement('img');
-                    img.className = 'day-image';
-                    img.src = imageUrl;
-                    img.alt = track;
-                    img.onerror = function() {
-                        this.style.display = 'none';
-                        let placeholder = document.createElement('div');
-                        placeholder.className = 'day-image no-image';
-                        placeholder.innerHTML = '🔍 Ver en Google';
-                        placeholder.style.cursor = 'pointer';
-                        placeholder.onclick = function(){ window.open(googleSearchUrl, '_blank'); };
-                        imgWrapper.appendChild(placeholder);
-                    };
+                    const img = document.createElement('img'); img.className='day-image'; img.src = imageUrl; img.alt = track;
+                    img.onerror = function(){ this.style.display='none'; };
                     imgWrapper.appendChild(img);
                 } else {
-                    let placeholder = document.createElement('div');
-                    placeholder.className = 'day-image no-image';
-                    placeholder.innerHTML = '🔍 Ver en Google';
-                    placeholder.style.cursor = 'pointer';
-                    placeholder.onclick = function(){ window.open(googleSearchUrl, '_blank'); };
-                    imgWrapper.appendChild(placeholder);
+                    const placeholder = document.createElement('div'); placeholder.className='day-image no-image'; placeholder.innerHTML='🔍 Ver en Google'; placeholder.onclick = ()=> window.open(googleSearchUrl,'_blank'); imgWrapper.appendChild(placeholder);
                 }
-
-                let infoDiv = document.createElement('div');
-                infoDiv.className = 'day-info';
-                infoDiv.innerHTML = '<div class="day-artist" title="' + artist + '">' + artist + '</div>' +
-                                    '<div class="day-track" title="' + track + '">' + track + '</div>' +
-                                    '<div class="day-plays">' + plays + ' escuchas</div>';
-
-                let dateDiv = document.createElement('div');
-                dateDiv.className = 'day-date';
-                dateDiv.textContent = date;
-
-                card.appendChild(dateDiv);
-                card.appendChild(imgWrapper);
-                card.appendChild(infoDiv);
-
-                card.onclick = () => openModal(date, artist, track, imageUrl, url, plays);
+                const infoDiv = document.createElement('div'); infoDiv.className='day-info';
+                infoDiv.innerHTML = '<div class="day-artist">' + (artist||'') + '</div><div class="day-track">' + (track||'') + '</div><div class="day-plays">' + (plays||0) + ' escuchas</div>';
+                const dateDiv = document.createElement('div'); dateDiv.className='day-date'; dateDiv.textContent = date;
+                card.appendChild(dateDiv); card.appendChild(imgWrapper); card.appendChild(infoDiv);
+                card.onclick = ()=> openModal(date, artist, track, imageUrl, url, plays||0);
                 calendar.appendChild(card);
             }
-            
             document.getElementById('totalDays').textContent = totalDays;
             document.getElementById('totalPlays').textContent = totalPlays;
         }
-        
-        function renderSummary(summary) {
-            if (!summary || Object.keys(summary).length === 0) return;
-            
-            // Obtener parámetros de configuración
-            const config = summary._config || {};
-            const n_items = config.n_items || 20;
-            const n_days = config.n_days || 5;
-            const n_peak_plays = config.n_peak_plays || 5;
-            
+
+        function renderCalendarAllDays(){ renderCalendarFromData(trackPerDay||{}); }
+
+        function renderCalendarForYearSimple(year){
+            if (year !== null && year !== undefined) {
+                const data = trackByYear[String(year)] || {};
+                renderCalendarFromData(data);
+            } else {
+                renderCalendarAllDays();
+            }
+        }
+
+        function renderHourlyChart(hourly){
+            if (!hourly) return;
+            const canvas = document.getElementById('hourChart'); if (!canvas || !canvas.getContext) return;
+            const ctx = canvas.getContext('2d'); const w = canvas.width, h = canvas.height; ctx.clearRect(0,0,w,h);
+            const totals = []; for (let i=0;i<24;i++){ totals.push((hourly[String(i)]&&hourly[String(i)].total)||0); }
+            const sum = totals.reduce((a,b)=>a+b,0); if (sum===0){ ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.beginPath(); ctx.arc(w/2,h/2,100,0,Math.PI*2); ctx.fill(); return; }
+            let start = -Math.PI/2; const radius = Math.min(w,h)*0.38;
+            for (let i=0;i<24;i++){ const val = totals[i]; const angle = val/sum*Math.PI*2; const end = start+angle; ctx.beginPath(); ctx.moveTo(w/2,h/2); ctx.fillStyle='hsl('+Math.round(i*(360/24))+',70%,60%)'; ctx.arc(w/2,h/2,radius,start,end); ctx.closePath(); ctx.fill(); start = end; }
+            // interactivity
+            let lastHour = null; canvas.onmousemove = function(ev){ const rect = canvas.getBoundingClientRect(); const x = ev.clientX-rect.left-w/2; const y = ev.clientY-rect.top-h/2; const ang = Math.atan2(y,x); let a = ang-(-Math.PI/2); if (a<0) a+=Math.PI*2; let acc=0; let hour=0; for (let i=0;i<24;i++){ const slice = totals[i]/sum*Math.PI*2; if (a>=acc && a<acc+slice){ hour=i; break;} acc+=slice;} if (hour===lastHour) return; lastHour=hour; const info = hourly[String(hour)]||{}; const detail = document.getElementById('hourDetail'); let html = '<strong>Hora: '+hour+':00</strong><br/>Total escuchas: <strong>'+(info.total||0)+'</strong><br/>'; if (info.top_artist) html += 'Top artista: <strong>'+info.top_artist[0]+'</strong> ('+info.top_artist[1]+')<br/>'; if (info.top_track) html += 'Top canción: <strong>'+ (info.top_track[1]||'') +'</strong> — '+(info.top_track[0]||'')+' ('+(info.top_track[2]||0)+')<br/>'; detail.innerHTML = html; };
+            canvas.onclick = function(ev){ const rect = canvas.getBoundingClientRect(); const x = ev.clientX-rect.left-w/2; const y = ev.clientY-rect.top-h/2; const ang = Math.atan2(y,x); let a = ang-(-Math.PI/2); if (a<0) a+=Math.PI*2; let acc=0; let hour=0; for (let i=0;i<24;i++){ const slice = totals[i]/sum*Math.PI*2; if (a>=acc && a<acc+slice){ hour=i; break;} acc+=slice;} const info = hourly[String(hour)]||{}; const tt = info.top_track||[]; if (tt && tt.length>=3){ openModal(hour+':00', tt[0], tt[1], '', '#', tt[2]); } };
+        }
+
+        function renderFullPage(summary){
+            if (!summary) return;
             let html = '<div class="stats" style="margin-bottom:18px; text-align:left;">';
             html += '<h2 style="margin-bottom:12px; text-align:center;">📊 Resumen de Estadísticas</h2>';
             
             // Top tracks
-            const tt = summary.top_tracks || [];
-            if (tt.length > 0) {
-                html += '<div style="margin-bottom:12px;"><strong>🔝 Top ' + n_items + ' Canciones:</strong><ol style="margin:4px 0 0 20px;">';
-                for (let item of tt) {
-                    const artist = item[0][0] || '';
-                    const track = item[0][1] || '';
-                    const plays = item[1] || 0;
-                    const peak = (summary.track_peaks || {})[artist + '||' + track] || {};
-                    const peakDay = peak.date || '';
-                    const peakPlays = peak.count || '';
-                    html += '<li>' + artist + ' — ' + track + ' (' + plays + ')';
-                    if (peakDay) html += ' — pico: ' + peakDay + ' (' + peakPlays + ')';
-                    html += '</li>';
+            const tt = summary.top_tracks||[];
+            if (tt.length>0){
+                html += '<div style="margin-bottom:12px;"><strong>🔝 Top '+(summary._config&&summary._config.n_items||20)+' Canciones:</strong><ol style="margin:4px 0 0 20px;">';
+                for (let item of tt){
+                    const artist = item[0][0]||'';
+                    const track = item[0][1]||'';
+                    const plays = item[1]||0;
+                    html += '<li>'+artist+' — '+track+' ('+plays+')</li>';
                 }
                 html += '</ol></div>';
             }
             
             // Top artists
-            const ta = summary.top_artists || [];
-            if (ta.length > 0) {
-                html += '<div style="margin-bottom:12px;"><strong>🎤 Top ' + n_items + ' Artistas:</strong><ol style="margin:4px 0 0 20px;">';
-                for (let item of ta) {
-                    html += '<li>' + item[0] + ' (' + item[1] + ' escuchas)</li>';
+            const ta = summary.top_artists||[];
+            if (ta.length>0){
+                html += '<div style="margin-bottom:12px;"><strong>🎤 Top '+(summary._config&&summary._config.n_items||20)+' Artistas:</strong><ol style="margin:4px 0 0 20px;">';
+                for (let item of ta){
+                    html += '<li>'+item[0]+' ('+item[1]+' escuchas)</li>';
                 }
                 html += '</ol></div>';
             }
             
             // Top albums
-            const tal = summary.top_albums || [];
-            if (tal.length > 0) {
-                html += '<div style="margin-bottom:12px;"><strong>💿 Top ' + n_items + ' Álbumes:</strong><ol style="margin:4px 0 0 20px;">';
-                for (let item of tal) {
-                    html += '<li>' + item[0][0] + ' — ' + item[0][1] + ' (' + item[1] + ' escuchas)</li>';
+            const tal = summary.top_albums||[];
+            if (tal.length>0){
+                html += '<div style="margin-bottom:12px;"><strong>💿 Top '+(summary._config&&summary._config.n_items||20)+' Álbumes:</strong><ol style="margin:4px 0 0 20px;">';
+                for (let item of tal){
+                    html += '<li>'+(item[0][0]||'')+' — '+(item[0][1]||'')+' ('+item[1]+' escuchas)</li>';
                 }
                 html += '</ol></div>';
             }
             
-            // Top days con canción más escuchada
-            const td = summary.top_days || [];
-            if (td.length > 0) {
-                html += '<div style="margin-bottom:12px;"><strong>🔥 Top ' + n_days + ' Días con Más Escuchas:</strong><ol style="margin:4px 0 0 20px;">';
-                for (let item of td) {
+            // Top days
+            const td = summary.top_days||[];
+            if (td.length>0){
+                html += '<div style="margin-bottom:12px;"><strong>🔥 Top '+(summary._config&&summary._config.n_days||5)+' Días con Más Escuchas:</strong><ol style="margin:4px 0 0 20px;">';
+                for (let item of td){
                     const day = item[0];
                     const plays = item[1];
-                    const m = (summary.top_days_most_played || {})[day] || {};
-                    const mArtist = m[0] || '';
-                    const mTrack = m[1] || '';
-                    const mPlays = m[2] || '';
-                    html += '<li>' + day + ' — <strong>' + plays + '</strong> escuchas';
-                    if (mTrack) html += ' — "' + mArtist + ' — ' + mTrack + '" (' + mPlays + ')';
+                    const m = (summary.top_days_most_played||{})[day]||{};
+                    html += '<li>'+day+' — <strong>'+plays+'</strong> escuchas';
+                    if (m[1]) html += ' — "'+(m[0]||'')+' — '+(m[1]||'')+'" ('+(m[2]||'')+')';
                     html += '</li>';
                 }
                 html += '</ol></div>';
             }
             
             // Top tracks by peak plays
-            const ttp = summary.top_tracks_peak_plays || [];
-            if (ttp.length > 0) {
-                html += '<div style="margin-bottom:12px;"><strong>⭐ Top ' + n_peak_plays + ' Canciones con Mayor Pico en un Día:</strong><ol style="margin:4px 0 0 20px;">';
-                for (let item of ttp) {
-                    const artist = item[0][0] || '';
-                    const track = item[0][1] || '';
-                    const peakPlays = item[1] || 0;
-                    const peakDay = item[2] || '';
-                    html += '<li>' + artist + ' — ' + track + ' (' + peakPlays + ' escuchas en ' + peakDay + ')</li>';
+            const ttp = summary.top_tracks_peak_plays||[];
+            if (ttp.length>0){
+                html += '<div style="margin-bottom:12px;"><strong>⭐ Top '+(summary._config&&summary._config.n_peak_plays||5)+' Canciones con Mayor Pico en un Día:</strong><ol style="margin:4px 0 0 20px;">';
+                for (let item of ttp){
+                    const artist = item[0][0]||'';
+                    const track = item[0][1]||'';
+                    const peakPlays = item[1]||0;
+                    const peakDay = item[2]||'';
+                    html += '<li>'+artist+' — '+track+' ('+peakPlays+' escuchas en '+peakDay+')</li>';
                 }
                 html += '</ol></div>';
             }
-
-            // Top tracks by consecutive days (rachas)
-            const ttc = summary.top_tracks_consecutive_days || [];
-            if (ttc.length > 0) {
-                html += '<div style="margin-bottom:12px;"><strong>🔥 Top ' + n_days + ' Canciones con Mayor Racha de Días Seguidos:</strong><ol style="margin:4px 0 0 20px;">';
-                for (let item of ttc) {
-                    const artist = item[0][0] || '';
-                    const track = item[0][1] || '';
-                    const streak = item[1] || 0;
-                    const startDay = item[2] || '';
-                    const endDay = item[3] || '';
-                    html += '<li>' + artist + ' — ' + track + ' (' + streak + ' días) — periodo: ' + startDay + ' → ' + endDay + '</li>';
+            
+            // Top tracks by consecutive days
+            const ttc = summary.top_tracks_consecutive_days||[];
+            if (ttc.length>0){
+                html += '<div style="margin-bottom:12px;"><strong>🔥 Top '+(summary._config&&summary._config.n_days||5)+' Canciones con Mayor Racha de Días Seguidos:</strong><ol style="margin:4px 0 0 20px;">';
+                for (let item of ttc){
+                    const artist = item[0][0]||'';
+                    const track = item[0][1]||'';
+                    const streak = item[1]||0;
+                    const startDay = item[2]||'';
+                    const endDay = item[3]||'';
+                    html += '<li>'+artist+' — '+track+' ('+streak+' días) — periodo: '+startDay+' → '+endDay+'</li>';
                 }
                 html += '</ol></div>';
             }
-
+            
             // Top artists by consecutive days
-            const tta = summary.top_artists_consecutive_days || [];
-            if (tta.length > 0) {
-                html += '<div style="margin-bottom:12px;"><strong>🎤 Top ' + n_days + ' Artistas con Mayor Racha de Días Seguidos:</strong><ol style="margin:4px 0 0 20px;">';
-                for (let item of tta) {
-                    const artist = item[0] || '';
-                    const streak = item[1] || 0;
-                    const startDay = item[2] || '';
-                    const endDay = item[3] || '';
-                    html += '<li>' + artist + ' (' + streak + ' días) — periodo: ' + startDay + ' → ' + endDay + '</li>';
+            const tta = summary.top_artists_consecutive_days||[];
+            if (tta.length>0){
+                html += '<div style="margin-bottom:12px;"><strong>🎤 Top '+(summary._config&&summary._config.n_days||5)+' Artistas con Mayor Racha de Días Seguidos:</strong><ol style="margin:4px 0 0 20px;">';
+                for (let item of tta){
+                    const artist = item[0]||'';
+                    const streak = item[1]||0;
+                    const startDay = item[2]||'';
+                    const endDay = item[3]||'';
+                    html += '<li>'+artist+' ('+streak+' días) — periodo: '+startDay+' → '+endDay+'</li>';
                 }
                 html += '</ol></div>';
             }
-
+            
             // Top albums by consecutive days
-            const tta2 = summary.top_albums_consecutive_days || [];
-            if (tta2.length > 0) {
-                html += '<div style="margin-bottom:12px;"><strong>💿 Top ' + n_days + ' Álbumes con Mayor Racha de Días Seguidos:</strong><ol style="margin:4px 0 0 20px;">';
-                for (let item of tta2) {
-                    const artist = item[0][0] || '';
-                    const album = item[0][1] || '';
-                    const streak = item[1] || 0;
-                    const startDay = item[2] || '';
-                    const endDay = item[3] || '';
-                    html += '<li>' + artist + ' — ' + album + ' (' + streak + ' días) — periodo: ' + startDay + ' → ' + endDay + '</li>';
+            const tta2 = summary.top_albums_consecutive_days||[];
+            if (tta2.length>0){
+                html += '<div style="margin-bottom:12px;"><strong>💿 Top '+(summary._config&&summary._config.n_days||5)+' Álbumes con Mayor Racha de Días Seguidos:</strong><ol style="margin:4px 0 0 20px;">';
+                for (let item of tta2){
+                    const artist = item[0][0]||'';
+                    const album = item[0][1]||'';
+                    const streak = item[1]||0;
+                    const startDay = item[2]||'';
+                    const endDay = item[3]||'';
+                    html += '<li>'+artist+' — '+album+' ('+streak+' días) — periodo: '+startDay+' → '+endDay+'</li>';
                 }
                 html += '</ol></div>';
             }
             
             html += '</div>';
             document.getElementById('summary-container').innerHTML = html;
-            // Render hourly chart if available
-            const hourly = summary.hourly_top || {};
-            try {
-                renderHourlyChart(hourly);
-            } catch (e) {
-                console.warn('No se pudo renderizar gráfico horario:', e);
-            }
-        }
-        
-        function renderHourlyChart(hourly) {
-            if (!hourly) return;
-            const canvas = document.getElementById('hourChart');
-            if (!canvas || !canvas.getContext) return;
-            const ctx = canvas.getContext('2d');
-            const w = canvas.width;
-            const h = canvas.height;
-            ctx.clearRect(0,0,w,h);
-
-            // Build totals array for 0..23
-            const totals = [];
-            for (let i=0;i<24;i++) {
-                const v = (hourly[String(i)] && hourly[String(i)].total) ? hourly[String(i)].total : 0;
-                totals.push(v);
-            }
-            const sum = totals.reduce((a,b)=>a+b,0);
-            if (sum === 0) {
-                // Draw empty circle
-                ctx.fillStyle = 'rgba(255,255,255,0.06)';
-                ctx.beginPath(); ctx.arc(w/2,h/2,100,0,Math.PI*2); ctx.fill();
-                return;
-            }
-
-            // Draw pie slices
-            let start = -Math.PI/2;
-            const radius = Math.min(w,h) * 0.38;
-            for (let i=0;i<24;i++) {
-                const val = totals[i];
-                const angle = val / sum * Math.PI*2;
-                const end = start + angle;
-                // color by hour
-                ctx.beginPath();
-                ctx.moveTo(w/2,h/2);
-                ctx.fillStyle = 'hsl(' + Math.round(i * (360/24)) + ',70%,60%)';
-                ctx.arc(w/2,h/2,radius,start,end);
-                ctx.closePath();
-                ctx.fill();
-                start = end;
-            }
-
-            // Add interactivity: mousemove shows detail (throttled to hour changes)
-            let lastHour = null;
-            canvas.onmousemove = function(ev) {
-                const rect = canvas.getBoundingClientRect();
-                const x = ev.clientX - rect.left - w/2;
-                const y = ev.clientY - rect.top - h/2;
-                const ang = Math.atan2(y,x);
-                let a = ang - (-Math.PI/2);
-                if (a < 0) a += Math.PI*2;
-                // find hour
-                let acc = 0; let hour = 0;
-                for (let i=0;i<24;i++){
-                    const slice = totals[i]/sum * Math.PI*2;
-                    if (a >= acc && a < acc + slice) { hour = i; break; }
-                    acc += slice;
-                }
-                if (hour === lastHour) return; // evitar actualizaciones si no cambia la hora
-                lastHour = hour;
-                const info = hourly[String(hour)] || {};
-                const ta = info.top_artist || [];
-                const tt = info.top_track || [];
-                const detail = document.getElementById('hourDetail');
-                let html = '<strong>Hora: ' + hour + ':00</strong><br/>';
-                html += 'Total escuchas: <strong>' + (info.total||0) + '</strong><br/>';
-                if (ta.length) html += 'Top artista: <strong>' + ta[0] + '</strong> (' + ta[1] + ')<br/>';
-                if (tt.length) html += 'Top canción: <strong>' + tt[1] + '</strong> — ' + tt[0] + ' (' + tt[2] + ')<br/>';
-                html += '<small>Haz clic en la porción para abrir el modal con más info.</small>';
-                detail.innerHTML = html;
-            };
-
-            canvas.onclick = function(ev) {
-                // reuse mousemove logic to get hour
-                const rect = canvas.getBoundingClientRect();
-                const x = ev.clientX - rect.left - w/2;
-                const y = ev.clientY - rect.top - h/2;
-                const ang = Math.atan2(y,x);
-                let a = ang - (-Math.PI/2);
-                if (a < 0) a += Math.PI*2;
-                let acc = 0; let hour = 0;
-                for (let i=0;i<24;i++){
-                    const slice = totals[i]/sum * Math.PI*2;
-                    if (a >= acc && a < acc + slice) { hour = i; break; }
-                    acc += slice;
-                }
-                const info = hourly[String(hour)] || {};
-                const tt = info.top_track || [];
-                if (tt && tt.length >= 3) {
-                    // open modal with top track info
-                    const date = hour + ':00';
-                    const artist = tt[0] || '';
-                    const track = tt[1] || '';
-                    const imageUrl = '';
-                    const url = '#';
-                    const plays = tt[2] || 0;
-                    openModal(date, artist, track, imageUrl, url, plays);
-                }
-            };
+            try { renderHourlyChart(summary.hourly_top || {}); } catch(e){ console.warn('hourly chart error', e); }
+            renderCalendarForYearSimple((summary._config && summary._config.split_by_year) ? currentYear : null);
         }
 
+        function renderSummary(summary){
+            if (!summary) return;
+            const splitEnabled = (summary._config && summary._config.split_by_year);
+            if (splitEnabled){
+                // Prefer summaryByYear if available, otherwise fall back to trackByYear keys
+                const dataByYear = summaryByYear || {};
+                let years = Object.keys(dataByYear).map(k=>parseInt(k)).filter(n=>!isNaN(n)).sort((a,b)=>b-a);
+                if (years.length === 0) {
+                    years = Object.keys(trackByYear || {}).map(k=>parseInt(k)).filter(n=>!isNaN(n)).sort((a,b)=>b-a);
+                }
+                if (years.length === 0) return;
+
+                let existing = document.getElementById('yearSelector'); if (existing) existing.remove();
+                const selector = document.createElement('div'); selector.id='yearSelector'; selector.style='text-align:center;margin-bottom:18px;color:white;'; selector.innerHTML = '<label style="font-weight:bold;margin-right:8px;color:white;">📅 Año:</label>';
+                const sel = document.createElement('select'); sel.id='yearSelect';
+                for (let y of years){ const opt=document.createElement('option'); opt.value=String(y); opt.text=String(y); sel.appendChild(opt); }
+                currentYear = years[0];
+                sel.onchange = function(){ currentYear = parseInt(this.value); const ys = (summaryByYear || {})[String(currentYear)]; if (ys) { summaryData = ys; renderFullPage(summaryData); } else { renderCalendarForYearSimple(currentYear); } };
+                selector.appendChild(sel);
+                const header = document.querySelector('.header'); if (header) header.parentNode.insertBefore(selector, header.nextSibling);
+                sel.value = String(currentYear);
+                const ys = (summaryByYear || {})[String(currentYear)];
+                if (ys) { summaryData = ys; renderFullPage(summaryData); } else { summaryData = summary; renderCalendarForYearSimple(currentYear); }
+            } else { currentYear = null; renderFullPage(summary); }
+        }
+
+        // Inicialización
+        let currentYear = null;
         renderSummary(summaryData);
-        renderCalendar();
-        
-        document.getElementById('modal').onclick = function(event) {
-            if (event.target === this) {
-                closeModal();
-            }
-        }
+        // Si no split, asegurarse de renderizar calendario completo
+        const splitEnabled = (summaryData && summaryData._config && summaryData._config.split_by_year);
+        if (!splitEnabled) renderCalendarAllDays();
+        document.getElementById('modal').onclick = function(ev){ if (ev.target === this) closeModal(); };
     </script>
 </body>
 </html>"""
