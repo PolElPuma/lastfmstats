@@ -1055,7 +1055,7 @@ class ScrobblesAnalyzer:
             summary_with_config = (summary or {}).copy()
             summary_by_year = {}
         
-        summary_with_config['_config'] = {
+        config = {
             'n_items': n_items,
             'n_days': n_days,
             'n_peak_plays': n_peak_plays,
@@ -1063,9 +1063,17 @@ class ScrobblesAnalyzer:
             'cards_per_page': cards_per_page
         }
         
+        summary_with_config['_config'] = config
+        
         # Incluir datos por hora si no están en el resumen
         if 'hourly_top' not in summary_with_config:
             summary_with_config['hourly_top'] = ScrobblesAnalyzer.get_hourly_top(scrobbles) or {}
+        
+        # Añadir configuración a cada resumen por año
+        if summary_by_year:
+            for year in summary_by_year:
+                if isinstance(summary_by_year[year], dict):
+                    summary_by_year[year]['_config'] = config
         
         track_json = json.dumps(track_per_day, ensure_ascii=False)
         track_by_year_json = json.dumps(track_by_year, ensure_ascii=False)
@@ -1324,7 +1332,7 @@ class ScrobblesAnalyzer:
 <body>
     <div class="container">
         <div class="header">
-            <h1>📅 Calendario de Escuchas</h1>
+            <h1>Calendario de Escuchas</h1>
             <p>Las canciones más escuchadas cada día</p>
         </div>
         
@@ -1333,7 +1341,7 @@ class ScrobblesAnalyzer:
         <div id="hourly-chart-container" style="margin:18px 0 28px; display:flex; gap:18px; align-items:center; justify-content:center;">
             <canvas id="hourChart" width="360" height="360" style="width:360px; height:360px; flex:0 0 360px; background:transparent; border-radius:8px;"></canvas>
             <div id="hourInfo" style="color:white; width:420px; font-size:0.95em; flex:0 0 420px;">
-                <h3 style="margin-bottom:6px;">🕒 Hora a Hora — Detalle</h3>
+                <h3 style="margin-bottom:6px;">Distribucion Horaria</h3>
                 <div id="hourDetail">Pasa el ratón sobre el gráfico para ver el artista y la canción más escuchados en esa hora.</div>
             </div>
         </div>
@@ -1398,7 +1406,7 @@ class ScrobblesAnalyzer:
                     img.onerror = function(){ this.style.display='none'; };
                     imgWrapper.appendChild(img);
                 } else {
-                    const placeholder = document.createElement('div'); placeholder.className='day-image no-image'; placeholder.innerHTML='🔍 Ver en Google'; placeholder.onclick = ()=> window.open(googleSearchUrl,'_blank'); imgWrapper.appendChild(placeholder);
+                    const placeholder = document.createElement('div'); placeholder.className='day-image no-image'; placeholder.innerHTML='Buscar en Google'; placeholder.onclick = ()=> window.open(googleSearchUrl,'_blank'); imgWrapper.appendChild(placeholder);
                 }
                 const infoDiv = document.createElement('div'); infoDiv.className='day-info';
                 infoDiv.innerHTML = '<div class="day-artist">' + (artist||'') + '</div><div class="day-track">' + (track||'') + '</div><div class="day-plays">' + (plays||0) + ' escuchas</div>';
@@ -1437,18 +1445,22 @@ class ScrobblesAnalyzer:
 
         function renderFullPage(summary){
             if (!summary) return;
+            const n_items = (summary._config && summary._config.n_items) || 20;
+            const n_days = (summary._config && summary._config.n_days) || 5;
+            const n_peak = (summary._config && summary._config.n_peak_plays) || 5;
+            
             let html = '<div class="stats" style="margin-bottom:18px; text-align:left;">';
-            html += '<h2 style="margin-bottom:12px; text-align:center;">📊 Resumen de Estadísticas</h2>';
+            html += '<h2 style="margin-bottom:20px; text-align:center; color:#667eea; border-bottom:2px solid #667eea; padding-bottom:10px;">RESUMEN DE ESTADISTICAS</h2>';
             
             // Top tracks
             const tt = summary.top_tracks||[];
             if (tt.length>0){
-                html += '<div style="margin-bottom:12px;"><strong>🔝 Top '+(summary._config&&summary._config.n_items||20)+' Canciones:</strong><ol style="margin:4px 0 0 20px;">';
+                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #667eea; border-radius:4px;"><strong style="color:#667eea;">TOP '+n_items+' CANCIONES</strong><ol style="margin:8px 0 0 20px;">';
                 for (let item of tt){
                     const artist = item[0][0]||'';
                     const track = item[0][1]||'';
                     const plays = item[1]||0;
-                    html += '<li>'+artist+' — '+track+' ('+plays+')</li>';
+                    html += '<li><strong style="font-size:1.05em; color:#333;">'+track+'</strong><br/><small style="color:#999;">por '+artist+'</small> <span style="color:#999;">('+plays+')</span></li>';
                 }
                 html += '</ol></div>';
             }
@@ -1456,9 +1468,9 @@ class ScrobblesAnalyzer:
             // Top artists
             const ta = summary.top_artists||[];
             if (ta.length>0){
-                html += '<div style="margin-bottom:12px;"><strong>🎤 Top '+(summary._config&&summary._config.n_items||20)+' Artistas:</strong><ol style="margin:4px 0 0 20px;">';
+                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #764ba2; border-radius:4px;"><strong style="color:#764ba2;">TOP '+n_items+' ARTISTAS</strong><ol style="margin:8px 0 0 20px;">';
                 for (let item of ta){
-                    html += '<li>'+item[0]+' ('+item[1]+' escuchas)</li>';
+                    html += '<li><strong>'+item[0]+'</strong> <span style="color:#999;">('+item[1]+' escuchas)</span></li>';
                 }
                 html += '</ol></div>';
             }
@@ -1466,9 +1478,9 @@ class ScrobblesAnalyzer:
             // Top albums
             const tal = summary.top_albums||[];
             if (tal.length>0){
-                html += '<div style="margin-bottom:12px;"><strong>💿 Top '+(summary._config&&summary._config.n_items||20)+' Álbumes:</strong><ol style="margin:4px 0 0 20px;">';
+                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #667eea; border-radius:4px;"><strong style="color:#667eea;">TOP '+n_items+' ALBUMES</strong><ol style="margin:8px 0 0 20px;">';
                 for (let item of tal){
-                    html += '<li>'+(item[0][0]||'')+' — '+(item[0][1]||'')+' ('+item[1]+' escuchas)</li>';
+                    html += '<li><strong>'+(item[0][0]||'')+' — '+(item[0][1]||'')+' </strong><span style="color:#999;">('+item[1]+' escuchas)</span></li>';
                 }
                 html += '</ol></div>';
             }
@@ -1476,13 +1488,13 @@ class ScrobblesAnalyzer:
             // Top days
             const td = summary.top_days||[];
             if (td.length>0){
-                html += '<div style="margin-bottom:12px;"><strong>🔥 Top '+(summary._config&&summary._config.n_days||5)+' Días con Más Escuchas:</strong><ol style="margin:4px 0 0 20px;">';
+                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #764ba2; border-radius:4px;"><strong style="color:#764ba2;">TOP '+n_days+' DIAS CON MAS ESCUCHAS</strong><ol style="margin:8px 0 0 20px;">';
                 for (let item of td){
                     const day = item[0];
                     const plays = item[1];
                     const m = (summary.top_days_most_played||{})[day]||{};
-                    html += '<li>'+day+' — <strong>'+plays+'</strong> escuchas';
-                    if (m[1]) html += ' — "'+(m[0]||'')+' — '+(m[1]||'')+'" ('+(m[2]||'')+')';
+                    html += '<li><strong>'+day+'</strong> — <strong style="color:#667eea;">'+plays+'</strong> escuchas';
+                    if (m[1]) html += ' — <em>'+(m[0]||'')+' — '+(m[1]||'')+' ('+m[2]+')</em>';
                     html += '</li>';
                 }
                 html += '</ol></div>';
@@ -1491,13 +1503,13 @@ class ScrobblesAnalyzer:
             // Top tracks by peak plays
             const ttp = summary.top_tracks_peak_plays||[];
             if (ttp.length>0){
-                html += '<div style="margin-bottom:12px;"><strong>⭐ Top '+(summary._config&&summary._config.n_peak_plays||5)+' Canciones con Mayor Pico en un Día:</strong><ol style="margin:4px 0 0 20px;">';
+                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #667eea; border-radius:4px;"><strong style="color:#667eea;">TOP '+n_peak+' PICOS DE ESCUCHAS (1 DIA)</strong><ol style="margin:8px 0 0 20px;">';
                 for (let item of ttp){
                     const artist = item[0][0]||'';
                     const track = item[0][1]||'';
                     const peakPlays = item[1]||0;
                     const peakDay = item[2]||'';
-                    html += '<li>'+artist+' — '+track+' ('+peakPlays+' escuchas en '+peakDay+')</li>';
+                    html += '<li><strong style="font-size:1.05em; color:#333;">'+track+'</strong><br/><small style="color:#999;">por '+artist+'</small> <span style="color:#999;">('+peakPlays+' en '+peakDay+')</span></li>';
                 }
                 html += '</ol></div>';
             }
@@ -1505,14 +1517,14 @@ class ScrobblesAnalyzer:
             // Top tracks by consecutive days
             const ttc = summary.top_tracks_consecutive_days||[];
             if (ttc.length>0){
-                html += '<div style="margin-bottom:12px;"><strong>🔥 Top '+(summary._config&&summary._config.n_days||5)+' Canciones con Mayor Racha de Días Seguidos:</strong><ol style="margin:4px 0 0 20px;">';
+                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #764ba2; border-radius:4px;"><strong style="color:#764ba2;">TOP '+n_days+' RACHAS DE CANCIONES</strong><ol style="margin:8px 0 0 20px;">';
                 for (let item of ttc){
                     const artist = item[0][0]||'';
                     const track = item[0][1]||'';
                     const streak = item[1]||0;
                     const startDay = item[2]||'';
                     const endDay = item[3]||'';
-                    html += '<li>'+artist+' — '+track+' ('+streak+' días) — periodo: '+startDay+' → '+endDay+'</li>';
+                    html += '<li><strong style="font-size:1.05em; color:#333;">'+track+'</strong><br/><small style="color:#999;">por '+artist+'</small> <span style="color:#667eea;">('+streak+' dias)</span><br/><small style="color:#999;">'+startDay+' hasta '+endDay+'</small></li>';
                 }
                 html += '</ol></div>';
             }
@@ -1520,13 +1532,13 @@ class ScrobblesAnalyzer:
             // Top artists by consecutive days
             const tta = summary.top_artists_consecutive_days||[];
             if (tta.length>0){
-                html += '<div style="margin-bottom:12px;"><strong>🎤 Top '+(summary._config&&summary._config.n_days||5)+' Artistas con Mayor Racha de Días Seguidos:</strong><ol style="margin:4px 0 0 20px;">';
+                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #667eea; border-radius:4px;"><strong style="color:#667eea;">TOP '+n_days+' RACHAS DE ARTISTAS</strong><ol style="margin:8px 0 0 20px;">';
                 for (let item of tta){
                     const artist = item[0]||'';
                     const streak = item[1]||0;
                     const startDay = item[2]||'';
                     const endDay = item[3]||'';
-                    html += '<li>'+artist+' ('+streak+' días) — periodo: '+startDay+' → '+endDay+'</li>';
+                    html += '<li><strong>'+artist+'</strong> <span style="color:#764ba2;">('+streak+' dias)</span><br/><small style="color:#999;">'+startDay+' hasta '+endDay+'</small></li>';
                 }
                 html += '</ol></div>';
             }
@@ -1534,14 +1546,14 @@ class ScrobblesAnalyzer:
             // Top albums by consecutive days
             const tta2 = summary.top_albums_consecutive_days||[];
             if (tta2.length>0){
-                html += '<div style="margin-bottom:12px;"><strong>💿 Top '+(summary._config&&summary._config.n_days||5)+' Álbumes con Mayor Racha de Días Seguidos:</strong><ol style="margin:4px 0 0 20px;">';
+                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #764ba2; border-radius:4px;"><strong style="color:#764ba2;">TOP '+n_days+' RACHAS DE ALBUMES</strong><ol style="margin:8px 0 0 20px;">';
                 for (let item of tta2){
                     const artist = item[0][0]||'';
                     const album = item[0][1]||'';
                     const streak = item[1]||0;
                     const startDay = item[2]||'';
                     const endDay = item[3]||'';
-                    html += '<li>'+artist+' — '+album+' ('+streak+' días) — periodo: '+startDay+' → '+endDay+'</li>';
+                    html += '<li><strong style="font-size:1.05em; color:#333;">'+album+'</strong><br/><small style="color:#999;">de '+artist+'</small> <span style="color:#667eea;">('+streak+' dias)</span><br/><small style="color:#999;">'+startDay+' hasta '+endDay+'</small></li>';
                 }
                 html += '</ol></div>';
             }
@@ -1565,16 +1577,23 @@ class ScrobblesAnalyzer:
                 if (years.length === 0) return;
 
                 let existing = document.getElementById('yearSelector'); if (existing) existing.remove();
-                const selector = document.createElement('div'); selector.id='yearSelector'; selector.style='text-align:center;margin-bottom:18px;color:white;'; selector.innerHTML = '<label style="font-weight:bold;margin-right:8px;color:white;">📅 Año:</label>';
-                const sel = document.createElement('select'); sel.id='yearSelect';
+                const selector = document.createElement('div'); selector.id='yearSelector'; selector.style='text-align:center;margin-bottom:18px;color:white;'; selector.innerHTML = '<label style="font-weight:bold;margin-right:8px;color:white;">Selecciona año:</label>';
+                const sel = document.createElement('select'); sel.id='yearSelect'; sel.style='padding:6px 12px;background:#667eea;color:white;border:none;border-radius:4px;cursor:pointer;';
                 for (let y of years){ const opt=document.createElement('option'); opt.value=String(y); opt.text=String(y); sel.appendChild(opt); }
                 currentYear = years[0];
-                sel.onchange = function(){ currentYear = parseInt(this.value); const ys = (summaryByYear || {})[String(currentYear)]; if (ys) { summaryData = ys; renderFullPage(summaryData); } else { renderCalendarForYearSimple(currentYear); } };
+                sel.onchange = function(){ currentYear = parseInt(this.value); const ys = (summaryByYear || {})[String(currentYear)]; 
+                    if (ys) { 
+                        summaryData = ys; renderFullPage(summaryData); 
+                    } else { 
+                        if (summary._config) { summaryData = summary; summaryData._currentYear = currentYear; renderFullPage(summaryData); } 
+                        renderCalendarForYearSimple(currentYear); 
+                    } 
+                };
                 selector.appendChild(sel);
                 const header = document.querySelector('.header'); if (header) header.parentNode.insertBefore(selector, header.nextSibling);
                 sel.value = String(currentYear);
                 const ys = (summaryByYear || {})[String(currentYear)];
-                if (ys) { summaryData = ys; renderFullPage(summaryData); } else { summaryData = summary; renderCalendarForYearSimple(currentYear); }
+                if (ys) { summaryData = ys; renderFullPage(summaryData); } else { summaryData = summary; renderFullPage(summaryData); renderCalendarForYearSimple(currentYear); }
             } else { currentYear = null; renderFullPage(summary); }
         }
 
