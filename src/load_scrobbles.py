@@ -7,6 +7,120 @@ from datetime import datetime, timezone, timedelta
 from collections import Counter, defaultdict
 from zoneinfo import ZoneInfo
 import time
+import requests
+from functools import lru_cache
+
+# Cache para duraciones de canciones (en memoria + disco)
+_duration_cache: Dict[Tuple[str, str], int] = {}
+_cache_filepath = Path(__file__).parent.parent / "data" / "durations.json"
+_api_key = 'b25b959554ed76058ac220b7b2e0a026'  # API key de Last.fm (debería ser configurable)
+
+# Cache para scrobbles por usuario (solo disco)
+_user_scrobbles_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+# Control de rate limit para la API de Last.fm
+_api_requests_per_sec_limit = 5  # límite seguro, ajustar según tu cuenta/uso
+_last_api_request_ts = 0.0
+_api_request_count = 0
+
+_track_duration_calls = 0
+
+
+def _load_duration_cache() -> None:
+    """Carga el caché de duraciones desde disco si existe."""
+    global _duration_cache
+    
+    if _cache_filepath.exists():
+        try:
+            with open(_cache_filepath, 'r', encoding='utf-8') as f:
+                cached_data = json.load(f)
+                # Convertir las claves de strings a tuplas (artist, track)
+                for key_str, duration in cached_data.items():
+                    try:
+                        artist, track = key_str.split('||', 1)
+                        _duration_cache[(artist, track)] = duration
+                    except ValueError:
+                        continue
+                print(f"✓ Caché de duraciones cargado: {len(_duration_cache)} canciones")
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"⚠ Error cargando caché de duraciones: {e}")
+
+
+def _save_duration_cache() -> None:
+    """Guarda el caché de duraciones a disco."""
+    try:
+        # Crear directorio si no existe
+        _cache_filepath.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Convertir las claves de tuplas a strings para JSON
+        cache_to_save = {f"{artist}||{track}": duration 
+                        for (artist, track), duration in _duration_cache.items()}
+        
+        with open(_cache_filepath, 'w', encoding='utf-8') as f:
+            json.dump(cache_to_save, f, ensure_ascii=False, indent=2)
+    except IOError as e:
+        print(f"⚠ Error guardando caché de duraciones: {e}")
+
+
+def _get_user_scrobbles_filepath(username: str) -> Path:
+    """Obtiene la ruta del archivo de caché para un usuario."""
+    return Path(__file__).parent.parent / "data" / f"scrobbles-{username}.json"
+
+
+def _load_user_scrobbles_cache(username: str) -> List[Dict[str, Any]]:
+    """Carga los scrobbles cacheados de un usuario desde disco."""
+    filepath = _get_user_scrobbles_filepath(username)
+    
+    if filepath.exists():
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                cached_data = json.load(f)
+                if isinstance(cached_data, list):
+                    print(f"✓ Caché de scrobbles cargado para {username}: {len(cached_data)} scrobbles")
+                    return cached_data
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"⚠ Error cargando caché de scrobbles para {username}: {e}")
+    
+    return []
+
+
+def _save_user_scrobbles_cache(username: str, scrobbles_data: List[Dict[str, Any]]) -> None:
+    """Guarda los scrobbles de un usuario a disco."""
+    try:
+        filepath = _get_user_scrobbles_filepath(username)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(scrobbles_data, f, ensure_ascii=False, indent=2)
+        
+        print(f"✓ Caché de scrobbles guardado para {username}: {len(scrobbles_data)} scrobbles")
+    except IOError as e:
+        print(f"⚠ Error guardando caché de scrobbles para {username}: {e}")
+
+
+def _enforce_api_rate_limit() -> None:
+    """Asegura que no se excedan las peticiones por segundo a Last.fm."""
+    global _last_api_request_ts, _api_request_count
+
+    now = time.time()
+    if now - _last_api_request_ts >= 1:
+        _api_request_count = 0
+        _last_api_request_ts = now
+
+    if _api_request_count >= _api_requests_per_sec_limit:
+        sleep_time = 1.0 - (now - _last_api_request_ts)
+        if sleep_time > 0:
+            print(f"[API] Ratelimit alcanzado, durmiendo {sleep_time:.2f}s...")
+            time.sleep(sleep_time)
+        _api_request_count = 0
+        _last_api_request_ts = time.time()
+
+    _api_request_count += 1
+
+
+# Cargar caché al iniciar el módulo
+_load_duration_cache()
+
 
 
 class Scrobble:
@@ -107,21 +221,101 @@ class ScrobblesLoader:
         files = glob.glob(pattern)
         return sorted(files)
     
-    def show_available_files(self) -> None:
-        """Muestra los archivos disponibles"""
-        files = self.list_files()
-        if not files:
-            print("No se encontraron archivos de scrobbles en la carpeta 'data'")
-            return
+    def download_recent_scrobbles(self, username: str, limit: Optional[int] = None) -> List[Scrobble]:
+        """
+        Descarga scrobbles desde la API de Last.fm, usando caché para evitar descargas redundantes
         
-        print("\n" + "="*60)
-        print("Archivos de Scrobbles Disponibles:")
-        print("="*60)
-        for i, file in enumerate(files, 1):
-            filename = Path(file).name
-            size_mb = Path(file).stat().st_size / (1024 * 1024)
-            print(f"{i}. {filename} ({size_mb:.2f} MB)")
-        print("="*60 + "\n")
+        Args:
+            username: Nombre de usuario de Last.fm
+            limit: Número máximo de scrobbles a descargar (None = todos disponibles)
+            
+        Returns:
+            Lista de objetos Scrobble
+        """
+        print(f"Descargando scrobbles para usuario: {username}...")
+        
+        # Cargar scrobbles cacheados
+        cached_scrobbles_data = _load_user_scrobbles_cache(username)
+        cached_scrobbles = [Scrobble(data) for data in cached_scrobbles_data]
+        
+        # Determinar desde qué timestamp descargar (si tenemos datos cacheados)
+        from_timestamp = None
+        if cached_scrobbles:
+            # Encontrar el scrobble más reciente en caché
+            latest_cached = max(cached_scrobbles, key=lambda s: int(s.uts) if s.uts else 0)
+            if latest_cached.uts:
+                from_timestamp = int(latest_cached.uts) + 1  # +1 para evitar duplicados
+                print(f"✓ Descargando scrobbles desde {datetime.fromtimestamp(from_timestamp).strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Descargar nuevos scrobbles
+        new_scrobbles_data = []
+        page = 1
+        per_page = 200  # Máximo permitido por Last.fm
+        total_downloaded = 0
+        
+        while True:
+            try:
+                _enforce_api_rate_limit()
+                print(f"[API fetch] Página {page}, total descargados: {total_downloaded}")
+                
+                # Construir URL con filtro de fecha si es necesario
+                url = f'http://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&user={requests.utils.quote(username)}&api_key={_api_key}&format=json&page={page}&limit={per_page}'
+                if from_timestamp:
+                    url += f'&from={from_timestamp}'
+                
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                
+                if 'recenttracks' not in data or 'track' not in data['recenttracks']:
+                    break
+                
+                tracks = data['recenttracks']['track']
+                if not tracks:
+                    break
+                
+                # Si es la primera página y no tenemos filtro de fecha, el primer track podría ser 'nowplaying'
+                if page == 1 and not from_timestamp and isinstance(tracks[0], dict) and tracks[0].get('@attr', {}).get('nowplaying'):
+                    tracks = tracks[1:]
+                
+                # Agregar tracks nuevos
+                page_tracks = 0
+                for track in tracks:
+                    # Verificar límite si se especificó
+                    if limit and total_downloaded >= limit:
+                        break
+                    
+                    new_scrobbles_data.append(track)
+                    page_tracks += 1
+                    total_downloaded += 1
+                
+                # Si hay menos tracks que per_page, o alcanzamos el límite, hemos terminado
+                if len(tracks) < per_page or (limit and total_downloaded >= limit):
+                    break
+                
+                page += 1
+                time.sleep(0.2)  # Pequeña pausa para no sobrecargar la API
+                
+            except (requests.RequestException, ValueError, KeyError) as e:
+                print(f"Error descargando página {page}: {e}")
+                break
+        
+        # Combinar scrobbles cacheados con los nuevos
+        all_scrobbles_data = cached_scrobbles_data + new_scrobbles_data
+        
+        # Si descargamos nuevos datos, guardar el caché actualizado
+        if new_scrobbles_data:
+            _save_user_scrobbles_cache(username, all_scrobbles_data)
+        
+        # Convertir a objetos Scrobble
+        all_scrobbles = [Scrobble(data) for data in all_scrobbles_data]
+        
+        # Aplicar límite final si se especificó
+        if limit and len(all_scrobbles) > limit:
+            all_scrobbles = all_scrobbles[-limit:]  # Mantener los más recientes
+        
+        print(f"✓ Total scrobbles disponibles: {len(all_scrobbles)} ({len(cached_scrobbles)} cacheados + {len(new_scrobbles_data)} nuevos)")
+        return all_scrobbles
     
     def load_file(self, filepath: str) -> List[Scrobble]:
         """
@@ -252,6 +446,63 @@ class ScrobblesAnalyzer:
             return None
     
     @staticmethod
+    def _get_track_duration(artist: str, track: str) -> Optional[int]:
+        """
+        Obtiene la duración de una canción desde caché o la API de Last.fm
+        
+        Args:
+            artist: Nombre del artista
+            track: Nombre de la canción
+            
+        Returns:
+            Duración en segundos, o None si no se puede obtener
+        """
+        global _duration_cache, _track_duration_calls
+
+        key = (artist, track)
+        # Búsqueda insensible a mayúsculas
+        key_lower = (artist.lower(), track.lower())
+        
+        # Buscar en caché con coincidencia exacta
+        if key in _duration_cache:
+            return _duration_cache[key]
+        
+        # Buscar en caché con coincidencia insensible a mayúsculas
+        for cached_key, duration in _duration_cache.items():
+            if (cached_key[0].lower(), cached_key[1].lower()) == key_lower:
+                _duration_cache[key] = duration  # Actualizar caché con la clave exacta
+                return duration
+
+        _track_duration_calls += 1
+        _enforce_api_rate_limit()
+        
+        if _track_duration_calls % 20 == 0 or _track_duration_calls <= 5:
+            print(f"[API duration] consulta #{_track_duration_calls}: {artist} - {track}")
+
+        try:
+            url = f'http://ws.audioscrobbler.com/2.0/?method=track.getInfo&api_key={_api_key}&artist={requests.utils.quote(artist)}&track={requests.utils.quote(track)}&format=json'
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'track' in data and 'duration' in data['track']:
+                duration_ms = int(data['track']['duration'])
+                if duration_ms > 0:
+                    duration_sec = duration_ms // 1000
+                    _duration_cache[key] = duration_sec
+                    _save_duration_cache()  # Guardar a disco inmediatamente
+                    return duration_sec
+            
+            # Si no hay duración, cachear None para evitar reintentos
+            _duration_cache[key] = None
+            _save_duration_cache()
+            return None
+            
+        except (requests.RequestException, ValueError, KeyError) as e:
+            _duration_cache[key] = None
+            return None
+    
+    @staticmethod
     def _filter_scrobbles_by_date(
         scrobbles: List[Scrobble],
         from_date: Optional[str] = None,
@@ -357,9 +608,105 @@ class ScrobblesAnalyzer:
             Lista de tuplas ((artista, canción), cantidad) ordenadas por cantidad descendente
         """
         filtered = ScrobblesAnalyzer._filter_scrobbles_by_date(scrobbles, from_date, to_date)
-        tracks = [(s.artist, s.track) for s in filtered if s.track]
+        # Crear tuplas con copias explícitas de strings para evitar referencias compartidas
+        tracks = [(str(s.artist), str(s.track)) for s in filtered if s.track]
         counter = Counter(tracks)
-        return counter.most_common(n)
+        # Retornar con copias explícitas para máxima seguridad
+        return [((str(artist), str(track)), int(count)) for (artist, track), count in counter.most_common(n)]
+    
+    @staticmethod
+    def get_top_artists_by_time(
+        scrobbles: List[Scrobble],
+        n: int = 10,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None
+    ) -> List[Tuple[str, int]]:
+        """
+        Obtiene los n artistas más escuchados por tiempo total
+        
+        Args:
+            scrobbles: Lista de scrobbles
+            n: Número de artistas a retornar
+            from_date: Fecha inicial (opcional)
+            to_date: Fecha final (opcional)
+            
+        Returns:
+            Lista de tuplas (artista, tiempo_total_segundos) ordenadas por tiempo descendente
+        """
+        filtered = ScrobblesAnalyzer._filter_scrobbles_by_date(scrobbles, from_date, to_date)
+        artist_times = defaultdict(int)
+        
+        for s in filtered:
+            if s.artist and s.track:
+                duration = ScrobblesAnalyzer._get_track_duration(s.artist, s.track)
+                if duration:
+                    artist_times[s.artist] += duration
+        
+        return sorted(artist_times.items(), key=lambda x: x[1], reverse=True)[:n]
+    
+    @staticmethod
+    def get_top_albums_by_time(
+        scrobbles: List[Scrobble],
+        n: int = 10,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None
+    ) -> List[Tuple[Tuple[str, str], int]]:
+        """
+        Obtiene los n álbumes más escuchados por tiempo total
+        
+        Args:
+            scrobbles: Lista de scrobbles
+            n: Número de álbumes a retornar
+            from_date: Fecha inicial (opcional)
+            to_date: Fecha final (opcional)
+            
+        Returns:
+            Lista de tuplas ((artista, álbum), tiempo_total_segundos) ordenadas por tiempo descendente
+        """
+        filtered = ScrobblesAnalyzer._filter_scrobbles_by_date(scrobbles, from_date, to_date)
+        album_times = defaultdict(int)
+        
+        for s in filtered:
+            if s.album and s.track:
+                duration = ScrobblesAnalyzer._get_track_duration(s.artist, s.track)
+                if duration:
+                    album_times[(s.artist, s.album)] += duration
+        
+        return sorted(album_times.items(), key=lambda x: x[1], reverse=True)[:n]
+    
+    @staticmethod
+    def get_top_tracks_by_time(
+        scrobbles: List[Scrobble],
+        n: int = 10,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None
+    ) -> List[Tuple[Tuple[str, str], int]]:
+        """
+        Obtiene las n canciones más escuchadas por tiempo total
+        
+        Args:
+            scrobbles: Lista de scrobbles
+            n: Número de canciones a retornar
+            from_date: Fecha inicial (opcional)
+            to_date: Fecha final (opcional)
+            
+        Returns:
+            Lista de tuplas ((artista, canción), tiempo_total_segundos) ordenadas por tiempo descendente
+        """
+        filtered = ScrobblesAnalyzer._filter_scrobbles_by_date(scrobbles, from_date, to_date)
+        track_times = defaultdict(int)
+        
+        for s in filtered:
+            if s.track:
+                duration = ScrobblesAnalyzer._get_track_duration(s.artist, s.track)
+                if duration:
+                    # Usar copias explícitas de strings como claves
+                    key = (str(s.artist), str(s.track))
+                    track_times[key] += duration
+        
+        # Retornar con copias explícitas para máxima seguridad
+        result = sorted(track_times.items(), key=lambda x: x[1], reverse=True)[:n]
+        return [((str(artist), str(track)), int(time_val)) for (artist, track), time_val in result]
     
     @staticmethod
     def _utc_to_local(utc_time_str: str) -> Optional[datetime]:
@@ -529,6 +876,42 @@ class ScrobblesAnalyzer:
         return day_counts.most_common(n)
     
     @staticmethod
+    def get_top_days_overall_by_time(
+        scrobbles: List[Scrobble],
+        n: int = 10
+    ) -> Optional[List[Tuple[str, int]]]:
+        """
+        Obtiene los n días con más tiempo escuchado en total (globales)
+        
+        Args:
+            scrobbles: Lista de scrobbles
+            n: Número de días top a retornar (default: 10)
+            
+        Returns:
+            Lista de tuplas (fecha, tiempo_total_segundos) ordenadas por tiempo descendente
+        """
+        if not scrobbles:
+            return None
+        
+        # Agrupar todos los scrobbles por día (en zona horaria local)
+        day_times = defaultdict(int)
+        
+        for scrobble in scrobbles:
+            local_dt = ScrobblesAnalyzer._utc_to_local(scrobble.utc_time)
+            
+            if local_dt:
+                day_key = local_dt.strftime("%d %b %Y")
+                duration = ScrobblesAnalyzer._get_track_duration(scrobble.artist, scrobble.track)
+                if duration:
+                    day_times[day_key] += duration
+        
+        if not day_times:
+            return None
+        
+        # Retornar los top n días ordenados por tiempo descendente
+        return sorted(day_times.items(), key=lambda x: x[1], reverse=True)[:n]
+    
+    @staticmethod
     def get_top_days_overall_by_artist_count(
         scrobbles: List[Scrobble],
         n: int = 10
@@ -660,7 +1043,72 @@ class ScrobblesAnalyzer:
                     if not image_url:
                         image_url = ''
                     
-                    result[day] = (artist, track, image_url, scrobble.url, count)
+                    # Usar copias explícitas de strings para evitar corrupción de datos
+                    result[day] = (str(artist), str(track), str(image_url), str(scrobble.url), int(count))
+        
+        return result if result else None
+    
+    @staticmethod
+    def get_most_played_track_per_day_by_time(
+        scrobbles: List[Scrobble]
+    ) -> Optional[Dict[str, Tuple[str, str, str, str, int]]]:
+        """
+        Obtiene para cada día la canción más escuchada por tiempo total
+        
+        Args:
+            scrobbles: Lista de scrobbles
+            
+        Returns:
+            Diccionario {fecha: (artista, track, imagen_url, url_track, tiempo_total_segundos)}
+            O None si no hay datos
+        """
+        if not scrobbles:
+            return None
+        
+        # Agrupar scrobbles por día y acumular tiempo por track
+        day_tracks = defaultdict(lambda: defaultdict(int))
+        
+        for scrobble in scrobbles:
+            local_dt = ScrobblesAnalyzer._utc_to_local(scrobble.utc_time)
+            
+            if local_dt:
+                day_key = local_dt.strftime("%d %b %Y")
+                track_key = (scrobble.artist, scrobble.track)
+                duration = ScrobblesAnalyzer._get_track_duration(scrobble.artist, scrobble.track)
+                if duration:
+                    day_tracks[day_key][track_key] += duration
+        
+        if not day_tracks:
+            return None
+        
+        # Para cada día, obtener el track con más tiempo
+        result = {}
+        
+        for day, track_times in day_tracks.items():
+            if track_times:
+                track_key, total_time = max(track_times.items(), key=lambda x: x[1])
+                artist, track = track_key
+                
+                # Buscar el scrobble para obtener metadatos
+                day_scrobbles = [
+                    s for s in scrobbles
+                    if s.artist == artist and s.track == track
+                ]
+                
+                if day_scrobbles:
+                    scrobble = day_scrobbles[0]
+                    # Obtener imagen (preferir extralarge)
+                    image_url = scrobble.images.get('extralarge', '')
+                    if not image_url:
+                        image_url = scrobble.images.get('large', '')
+                    if not image_url:
+                        image_url = scrobble.images.get('medium', '')
+                    # Si no hay imagen en Last.fm, dejar en blanco (sin búsqueda externa)
+                    if not image_url:
+                        image_url = ''
+                    
+                    # Usar copias explícitas de strings para evitar corrupción de datos
+                    result[day] = (str(artist), str(track), str(image_url), str(scrobble.url), int(total_time))
         
         return result if result else None
     
@@ -718,6 +1166,7 @@ class ScrobblesAnalyzer:
     ) -> Optional[List[Tuple[Tuple[str, str], int, str, str]]]:
         """
         Obtiene las N canciones que se escucharon en más días seguidos (racha más larga).
+        Una racha se define como secuencias donde cada scrobble está dentro de 48 horas del anterior.
 
         Args:
             scrobbles: Lista de scrobbles
@@ -731,65 +1180,65 @@ class ScrobblesAnalyzer:
         if not scrobbles:
             return None
 
-        # Para cada canción, construir el conjunto de días únicos en los que fue escuchada
-        track_days: Dict[Tuple[str, str], set] = defaultdict(set)
+        # Para cada canción, obtener lista de timestamps únicos por día
+        track_timestamps: Dict[Tuple[str, str], List[datetime]] = defaultdict(list)
 
         for scrobble in scrobbles:
             local_dt = ScrobblesAnalyzer._utc_to_local(scrobble.utc_time)
             if local_dt and scrobble.track and scrobble.artist:
-                day = local_dt.date()
                 key = (scrobble.artist, scrobble.track)
-                track_days[key].add(day)
+                track_timestamps[key].append(local_dt)
 
-        if not track_days:
+        if not track_timestamps:
             return None
 
         results: List[Tuple[Tuple[str, str], int, str, str]] = []
 
-        # Para cada pista, calcular la racha máxima de días consecutivos
-        for (artist, track), days_set in track_days.items():
-            if not days_set:
+        # Para cada pista, calcular la racha máxima usando 48 horas
+        for (artist, track), timestamps in track_timestamps.items():
+            if not timestamps:
                 continue
 
-            # Ordenar días
-            days_sorted = sorted(days_set)
+            # Ordenar timestamps
+            timestamps_sorted = sorted(timestamps)
 
-            max_streak = 0
-            max_start = None
-            max_end = None
+            max_streak_days = 0
+            max_start_day = None
+            max_end_day = None
 
-            cur_streak = 0
-            cur_start = None
-            prev_day = None
+            current_streak_days = set()
+            current_start = None
 
-            for d in days_sorted:
-                if prev_day is None:
-                    cur_streak = 1
-                    cur_start = d
+            for i, ts in enumerate(timestamps_sorted):
+                # Si es el primer o está dentro de 48 horas del último en la racha actual
+                if not current_streak_days or (ts - max(current_streak_days, key=lambda x: x)).total_seconds() <= 48 * 3600:
+                    current_streak_days.add(ts)
+                    if current_start is None:
+                        current_start = ts
                 else:
-                    if (d - prev_day).days == 1:
-                        cur_streak += 1
-                    else:
-                        # racha interrumpida
-                        if cur_streak > max_streak:
-                            max_streak = cur_streak
-                            max_start = cur_start
-                            max_end = prev_day
-                        cur_streak = 1
-                        cur_start = d
+                    # Evaluar racha actual
+                    streak_length = len(set(ts.date() for ts in current_streak_days))
+                    if streak_length > max_streak_days:
+                        max_streak_days = streak_length
+                        max_start_day = min(current_streak_days, key=lambda x: x).date()
+                        max_end_day = max(current_streak_days, key=lambda x: x).date()
+                    
+                    # Iniciar nueva racha
+                    current_streak_days = {ts}
+                    current_start = ts
 
-                prev_day = d
+            # Evaluar última racha
+            if current_streak_days:
+                streak_length = len(set(ts.date() for ts in current_streak_days))
+                if streak_length > max_streak_days:
+                    max_streak_days = streak_length
+                    max_start_day = min(current_streak_days, key=lambda x: x).date()
+                    max_end_day = max(current_streak_days, key=lambda x: x).date()
 
-            # Chequear la última racha
-            if cur_streak > max_streak:
-                max_streak = cur_streak
-                max_start = cur_start
-                max_end = prev_day
-
-            if max_streak > 0 and max_start and max_end:
-                start_str = max_start.strftime("%d %b %Y")
-                end_str = max_end.strftime("%d %b %Y")
-                results.append(((artist, track), max_streak, start_str, end_str))
+            if max_streak_days > 0 and max_start_day and max_end_day:
+                start_str = max_start_day.strftime("%d %b %Y")
+                end_str = max_end_day.strftime("%d %b %Y")
+                results.append(((artist, track), max_streak_days, start_str, end_str))
 
         # Ordenar por longitud de racha descendente
         results.sort(key=lambda x: x[1], reverse=True)
@@ -803,6 +1252,7 @@ class ScrobblesAnalyzer:
     ) -> Optional[List[Tuple[str, int, str, str]]]:
         """
         Obtiene las N artistas que se escucharon en más días seguidos (racha más larga).
+        Una racha se define como secuencias donde cada scrobble está dentro de 48 horas del anterior.
 
         Args:
             scrobbles: Lista de scrobbles
@@ -815,59 +1265,57 @@ class ScrobblesAnalyzer:
         if not scrobbles:
             return None
 
-        artist_days: Dict[str, set] = defaultdict(set)
+        artist_timestamps: Dict[str, List[datetime]] = defaultdict(list)
 
         for scrobble in scrobbles:
             local_dt = ScrobblesAnalyzer._utc_to_local(scrobble.utc_time)
             if local_dt and scrobble.artist:
-                day = local_dt.date()
-                artist_days[scrobble.artist].add(day)
+                artist_timestamps[scrobble.artist].append(local_dt)
 
-        if not artist_days:
+        if not artist_timestamps:
             return None
 
         results: List[Tuple[str, int, str, str]] = []
 
-        for artist, days_set in artist_days.items():
-            if not days_set:
+        for artist, timestamps in artist_timestamps.items():
+            if not timestamps:
                 continue
 
-            days_sorted = sorted(days_set)
+            timestamps_sorted = sorted(timestamps)
 
-            max_streak = 0
-            max_start = None
-            max_end = None
+            max_streak_days = 0
+            max_start_day = None
+            max_end_day = None
 
-            cur_streak = 0
-            cur_start = None
-            prev_day = None
+            current_streak_days = set()
+            current_start = None
 
-            for d in days_sorted:
-                if prev_day is None:
-                    cur_streak = 1
-                    cur_start = d
+            for i, ts in enumerate(timestamps_sorted):
+                if not current_streak_days or (ts - max(current_streak_days, key=lambda x: x)).total_seconds() <= 48 * 3600:
+                    current_streak_days.add(ts)
+                    if current_start is None:
+                        current_start = ts
                 else:
-                    if (d - prev_day).days == 1:
-                        cur_streak += 1
-                    else:
-                        if cur_streak > max_streak:
-                            max_streak = cur_streak
-                            max_start = cur_start
-                            max_end = prev_day
-                        cur_streak = 1
-                        cur_start = d
+                    streak_length = len(set(ts.date() for ts in current_streak_days))
+                    if streak_length > max_streak_days:
+                        max_streak_days = streak_length
+                        max_start_day = min(current_streak_days, key=lambda x: x).date()
+                        max_end_day = max(current_streak_days, key=lambda x: x).date()
+                    
+                    current_streak_days = {ts}
+                    current_start = ts
 
-                prev_day = d
+            if current_streak_days:
+                streak_length = len(set(ts.date() for ts in current_streak_days))
+                if streak_length > max_streak_days:
+                    max_streak_days = streak_length
+                    max_start_day = min(current_streak_days, key=lambda x: x).date()
+                    max_end_day = max(current_streak_days, key=lambda x: x).date()
 
-            if cur_streak > max_streak:
-                max_streak = cur_streak
-                max_start = cur_start
-                max_end = prev_day
-
-            if max_streak > 0 and max_start and max_end:
-                start_str = max_start.strftime("%d %b %Y")
-                end_str = max_end.strftime("%d %b %Y")
-                results.append((artist, max_streak, start_str, end_str))
+            if max_streak_days > 0 and max_start_day and max_end_day:
+                start_str = max_start_day.strftime("%d %b %Y")
+                end_str = max_end_day.strftime("%d %b %Y")
+                results.append((artist, max_streak_days, start_str, end_str))
 
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:n] if results else None
@@ -879,6 +1327,7 @@ class ScrobblesAnalyzer:
     ) -> Optional[List[Tuple[Tuple[str, str], int, str, str]]]:
         """
         Obtiene las N parejas (artista, álbum) que se escucharon en más días seguidos.
+        Una racha se define como secuencias donde cada scrobble está dentro de 48 horas del anterior.
 
         Args:
             scrobbles: Lista de scrobbles
@@ -890,60 +1339,58 @@ class ScrobblesAnalyzer:
         if not scrobbles:
             return None
 
-        album_days: Dict[Tuple[str, str], set] = defaultdict(set)
+        album_timestamps: Dict[Tuple[str, str], List[datetime]] = defaultdict(list)
 
         for scrobble in scrobbles:
             local_dt = ScrobblesAnalyzer._utc_to_local(scrobble.utc_time)
             if local_dt and scrobble.artist and scrobble.album:
-                day = local_dt.date()
                 key = (scrobble.artist, scrobble.album)
-                album_days[key].add(day)
+                album_timestamps[key].append(local_dt)
 
-        if not album_days:
+        if not album_timestamps:
             return None
 
         results: List[Tuple[Tuple[str, str], int, str, str]] = []
 
-        for (artist, album), days_set in album_days.items():
-            if not days_set:
+        for (artist, album), timestamps in album_timestamps.items():
+            if not timestamps:
                 continue
 
-            days_sorted = sorted(days_set)
+            timestamps_sorted = sorted(timestamps)
 
-            max_streak = 0
-            max_start = None
-            max_end = None
+            max_streak_days = 0
+            max_start_day = None
+            max_end_day = None
 
-            cur_streak = 0
-            cur_start = None
-            prev_day = None
+            current_streak_days = set()
+            current_start = None
 
-            for d in days_sorted:
-                if prev_day is None:
-                    cur_streak = 1
-                    cur_start = d
+            for i, ts in enumerate(timestamps_sorted):
+                if not current_streak_days or (ts - max(current_streak_days, key=lambda x: x)).total_seconds() <= 48 * 3600:
+                    current_streak_days.add(ts)
+                    if current_start is None:
+                        current_start = ts
                 else:
-                    if (d - prev_day).days == 1:
-                        cur_streak += 1
-                    else:
-                        if cur_streak > max_streak:
-                            max_streak = cur_streak
-                            max_start = cur_start
-                            max_end = prev_day
-                        cur_streak = 1
-                        cur_start = d
+                    streak_length = len(set(ts.date() for ts in current_streak_days))
+                    if streak_length > max_streak_days:
+                        max_streak_days = streak_length
+                        max_start_day = min(current_streak_days, key=lambda x: x).date()
+                        max_end_day = max(current_streak_days, key=lambda x: x).date()
+                    
+                    current_streak_days = {ts}
+                    current_start = ts
 
-                prev_day = d
+            if current_streak_days:
+                streak_length = len(set(ts.date() for ts in current_streak_days))
+                if streak_length > max_streak_days:
+                    max_streak_days = streak_length
+                    max_start_day = min(current_streak_days, key=lambda x: x).date()
+                    max_end_day = max(current_streak_days, key=lambda x: x).date()
 
-            if cur_streak > max_streak:
-                max_streak = cur_streak
-                max_start = cur_start
-                max_end = prev_day
-
-            if max_streak > 0 and max_start and max_end:
-                start_str = max_start.strftime("%d %b %Y")
-                end_str = max_end.strftime("%d %b %Y")
-                results.append(((artist, album), max_streak, start_str, end_str))
+            if max_streak_days > 0 and max_start_day and max_end_day:
+                start_str = max_start_day.strftime("%d %b %Y")
+                end_str = max_end_day.strftime("%d %b %Y")
+                results.append(((artist, album), max_streak_days, start_str, end_str))
 
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:n] if results else None
@@ -1011,7 +1458,8 @@ class ScrobblesAnalyzer:
         n_days: int = 5,
         n_peak_plays: int = 5,
         split_by_year: bool = False,
-        cards_per_page: int = 120
+        cards_per_page: int = 120,
+        by_time: bool = False
     ) -> None:
         """
         Genera un archivo HTML con un calendario visual de las canciones más escuchadas
@@ -1024,8 +1472,9 @@ class ScrobblesAnalyzer:
             n_days: Número de días top a mostrar
             n_peak_plays: Número de canciones con mayor pico a mostrar
             split_by_year: Si True, agrupa análisis por año
+            by_time: Si True, las estadísticas son por tiempo total en lugar de conteo
         """
-        track_per_day = ScrobblesAnalyzer.get_most_played_track_per_day(scrobbles)
+        track_per_day = ScrobblesAnalyzer.get_most_played_track_per_day_by_time(scrobbles) if by_time else ScrobblesAnalyzer.get_most_played_track_per_day(scrobbles)
         
         if not track_per_day:
             print("No hay datos para generar calendario")
@@ -1083,12 +1532,14 @@ class ScrobblesAnalyzer:
         summary_by_year_json = json.dumps(summary_by_year, ensure_ascii=False) if summary_by_year else "{}"
 
         # Crear HTML
+        title_suffix = " (por Tiempo)" if by_time else ""
+        time_desc = " (por tiempo total)" if by_time else ""
         html = """<!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Calendario de Escuchas - Last.fm Stats</title>
+    <title>Calendario de Escuchas""" + title_suffix + """ - Last.fm Stats</title>
     <style>
         * {
             margin: 0;
@@ -1332,8 +1783,8 @@ class ScrobblesAnalyzer:
 <body>
     <div class="container">
         <div class="header">
-            <h1>Calendario de Escuchas</h1>
-            <p>Las canciones más escuchadas cada día</p>
+            <h1>Calendario de Escuchas""" + title_suffix + """</h1>
+            <p>Las canciones más escuchadas cada día""" + time_desc + """</p>
         </div>
         
         <div id="summary-container"></div>

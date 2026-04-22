@@ -6,6 +6,7 @@ from load_scrobbles import ScrobblesLoader, ScrobblesAnalyzer, Scrobble
 from typing import Dict, Any, Tuple, List, Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 
 def select_file() -> Optional[str]:
@@ -13,35 +14,72 @@ def select_file() -> Optional[str]:
     Permite al usuario seleccionar un archivo JSON de scrobbles
     
     Returns:
-        Ruta del archivo seleccionado o None si se cancela
+        Ruta del archivo seleccionado o None si no hay archivos disponibles
     """
-    loader = ScrobblesLoader('data')
-    files = loader.list_files()
+    data_dir = Path(__file__).parent.parent / "data"
+    scrobble_files = sorted(data_dir.glob("scrobbles-*.json"))
     
-    if not files:
-        print("❌ No se encontraron archivos de scrobbles en la carpeta 'data'")
+    if not scrobble_files:
+        print("❌ No hay archivos JSON de scrobbles en la carpeta data/")
         return None
     
     print("\n" + "="*60)
-    print("📁 Archivos de Scrobbles Disponibles:")
+    print("📁 Archivos de Scrobbles Disponibles")
     print("="*60)
-    for i, file in enumerate(files, 1):
-        from pathlib import Path
-        filename = Path(file).name
-        size_mb = Path(file).stat().st_size / (1024 * 1024)
-        print(f"{i}. {filename} ({size_mb:.2f} MB)")
+    
+    for i, file_path in enumerate(scrobble_files, 1):
+        file_size_mb = file_path.stat().st_size / (1024 * 1024)
+        print(f"{i}. {file_path.name} ({file_size_mb:.2f} MB)")
+    
     print("="*60)
     
     while True:
         try:
-            choice = input(f"\nSelecciona un archivo (1-{len(files)}): ").strip()
+            choice = input("\nSelecciona archivo (número): ").strip()
             idx = int(choice) - 1
-            if 0 <= idx < len(files):
-                return files[idx]
+            
+            if 0 <= idx < len(scrobble_files):
+                selected = scrobble_files[idx]
+                print(f"✓ Archivo seleccionado: {selected.name}")
+                return str(selected)
             else:
-                print(f"❌ Por favor ingresa un número entre 1 y {len(files)}")
+                print("❌ Selección inválida")
         except ValueError:
-            print("❌ Entrada inválida. Ingresa un número.")
+            print("❌ Por favor, ingresa un número válido")
+
+
+def select_data_source() -> Tuple[str, Optional[str]]:
+    """
+    Permite al usuario seleccionar la fuente de datos
+    
+    Returns:
+        Tupla (source_type, value) donde source_type es 'file' o 'api', y value es la ruta del archivo o el username
+    """
+    print("\n" + "="*60)
+    print("📊 Fuente de Datos")
+    print("="*60)
+    print("1. Cargar desde archivo JSON exportado")
+    print("2. Descargar datos desde Last.fm API (descarga todos los scrobbles disponibles)")
+    print("   - Los datos se cachean por usuario para evitar descargas redundantes")
+    print("   - En descargas posteriores, solo se obtienen scrobbles nuevos")
+    print("="*60)
+    
+    while True:
+        choice = input("\nSelecciona fuente (1-2): ").strip()
+        if choice == '1':
+            filepath = select_file()
+            if filepath:
+                return ('file', filepath)
+            else:
+                continue
+        elif choice == '2':
+            username = input("Ingresa tu nombre de usuario de Last.fm: ").strip()
+            if username:
+                return ('api', username)
+            else:
+                print("❌ Nombre de usuario requerido")
+        else:
+            print("❌ Selección inválida")
 
 
 def select_start_date() -> Optional[datetime]:
@@ -201,6 +239,17 @@ def select_split_by_year() -> bool:
             print("❌ Por favor, ingresa 's' o 'n'")
 
 
+def select_include_time_stats() -> bool:
+    """Pregunta al usuario si desea estadísticas by_time en el calendario."""
+    while True:
+        choice = input("\n¿Incluir estadísticas por tiempo total en el calendario? (s/N): ").strip().lower()
+        if choice in ('s', 'si', 'y', 'yes'):
+            print("✓ Incluyendo estadísticas por tiempo total")
+            return True
+        if choice == '' or choice in ('n', 'no'):
+            print("✓ No se incluirán estadísticas por tiempo total")
+            return False
+        print("❌ Por favor, ingresa 's' o 'n'")
 
 
 def calculate_summary_for_scrobbles(scrobbles: List[Scrobble], n_items: int, n_days: int, n_peak_plays: int) -> Dict[str, Any]:
@@ -272,15 +321,90 @@ def calculate_summary_for_scrobbles(scrobbles: List[Scrobble], n_items: int, n_d
     }
 
 
+def calculate_summary_for_scrobbles_by_time(scrobbles: List[Scrobble], n_items: int, n_days: int, n_peak_plays: int) -> Dict[str, Any]:
+    """
+    Calcula un resumen de estadísticas por tiempo total para un conjunto de scrobbles.
+    
+    Args:
+        scrobbles: Lista de scrobbles
+        n_items: Número de items a incluir en tops
+        n_days: Número de días para tops
+        n_peak_plays: Número de tracks para peak plays
+    
+    Returns:
+        Diccionario con todas las estadísticas por tiempo
+    """
+    top_tracks = ScrobblesAnalyzer.get_top_tracks_by_time(scrobbles, n=n_items) or []
+
+    # Para cada top track, obtener el día pico (por tiempo)
+    track_peaks: Dict[str, Dict[str, Any]] = {}
+    for (artist, track), _ in top_tracks:
+        # Nota: get_peak_day_for_track es por conteo, pero para tiempo sería diferente
+        # Por simplicidad, usamos el mismo por ahora
+        res = ScrobblesAnalyzer.get_peak_day_for_track(scrobbles, artist, track)
+        key = f"{artist}||{track}"
+        if res:
+            date, count, total = res
+            track_peaks[key] = {"date": date, "count": count, "total": total}
+        else:
+            track_peaks[key] = {}
+
+    # Top N artistas por tiempo
+    top_artists = ScrobblesAnalyzer.get_top_artists_by_time(scrobbles, n=n_items) or []
+
+    # Top N álbumes por tiempo
+    top_albums = ScrobblesAnalyzer.get_top_albums_by_time(scrobbles, n=n_items) or []
+
+    # Top N días por tiempo
+    top_days = ScrobblesAnalyzer.get_top_days_overall_by_time(scrobbles, n=n_days) or []
+
+    # Obtener la canción más escuchada de cada uno de esos días (por tiempo)
+    most_played = ScrobblesAnalyzer.get_most_played_track_per_day_by_time(scrobbles) or {}
+    top_days_most_played = {}
+    for day, _ in top_days:
+        if day in most_played:
+            artist, track, image_url, url, time_total = most_played[day]
+            top_days_most_played[day] = (artist, track, time_total)
+        else:
+            top_days_most_played[day] = ()
+
+    # Top N canciones por tiempo en su día pico (esto es más complejo, por ahora usamos el mismo)
+    top_tracks_peak_plays = ScrobblesAnalyzer.get_top_tracks_by_peak_plays(scrobbles, n=n_peak_plays) or []
+
+    # Los consecutivos no cambian
+    top_tracks_consecutive = ScrobblesAnalyzer.get_top_tracks_by_consecutive_days(scrobbles, n=n_days) or []
+    top_artists_consecutive = ScrobblesAnalyzer.get_top_artists_by_consecutive_days(scrobbles, n=n_days) or []
+    top_albums_consecutive = ScrobblesAnalyzer.get_top_albums_by_consecutive_days(scrobbles, n=n_days) or []
+
+    return {
+        "top_tracks": top_tracks,
+        "track_peaks": track_peaks,
+        "top_tracks_consecutive_days": top_tracks_consecutive,
+        "top_artists_consecutive_days": top_artists_consecutive,
+        "top_albums_consecutive_days": top_albums_consecutive,
+        "hourly_top": ScrobblesAnalyzer.get_hourly_top(scrobbles) or {},
+        "top_artists": top_artists,
+        "top_albums": top_albums,
+        "top_days": top_days,
+        "top_days_most_played": top_days_most_played,
+        "top_tracks_peak_plays": top_tracks_peak_plays,
+    }
+
+
 def main():
-    # Seleccionar archivo
-    filepath = select_file()
-    if not filepath:
-        return
+    # Seleccionar fuente de datos
+    source_type, value = select_data_source()
     
     # Cargar scrobbles
     loader = ScrobblesLoader('data')
-    scrobbles = loader.load_file(filepath)
+    if source_type == 'file':
+        scrobbles = loader.load_file(value)
+    elif source_type == 'api':
+        scrobbles = loader.download_recent_scrobbles(value)  # Descarga todos los scrobbles disponibles con caché inteligente
+    else:
+        print("❌ Fuente de datos inválida")
+        return
+    
     if not scrobbles:
         print("❌ No se cargaron scrobbles. Saliendo.")
         return
@@ -307,15 +431,18 @@ def main():
     
     # Seleccionar si dividir por años
     split_by_year = select_split_by_year()
-    
+
+    # Seleccionar si incluir estadísticas de tiempo
+    include_time_stats = select_include_time_stats()
+
     # Calcular estadísticas
     print("\n📊 Calculando estadísticas...")
-    
+
     if split_by_year:
         # Agrupar scrobbles por año y calcular stats para cada año
         from datetime import datetime
         from collections import defaultdict
-        
+
         scrobbles_by_year: Dict[int, List[Scrobble]] = defaultdict(list)
         for scrobble in scrobbles:
             try:
@@ -323,38 +450,49 @@ def main():
             except (ValueError, TypeError):
                 year = 0
             scrobbles_by_year[year].append(scrobble)
-        
+
         summary_by_year: Dict[int, Dict[str, Any]] = {}
         for year in sorted(scrobbles_by_year.keys(), reverse=True):
             if year == 0:
                 continue  # Saltar años inválidos
             print(f"  📅 {year}...", end=" ", flush=True)
-            summary_by_year[year] = calculate_summary_for_scrobbles(
-                scrobbles_by_year[year],
-                n_items, n_days, n_peak_plays
-            )
+            if include_time_stats:
+                summary_by_year[year] = calculate_summary_for_scrobbles_by_time(
+                    scrobbles_by_year[year],
+                    n_items, n_days, n_peak_plays
+                )
+            else:
+                summary_by_year[year] = calculate_summary_for_scrobbles(
+                    scrobbles_by_year[year],
+                    n_items, n_days, n_peak_plays
+                )
             print("✓")
-        
+
         summary = summary_by_year
     else:
-        summary = calculate_summary_for_scrobbles(scrobbles, n_items, n_days, n_peak_plays)
+        if include_time_stats:
+            summary = calculate_summary_for_scrobbles_by_time(scrobbles, n_items, n_days, n_peak_plays)
+        else:
+            summary = calculate_summary_for_scrobbles(scrobbles, n_items, n_days, n_peak_plays)
 
     print("✓ Estadísticas calculadas")
     print("\n📝 Generando calendar.html con resumen...")
     ScrobblesAnalyzer.generate_calendar_html(
-        scrobbles, 
-        output_file="calendar.html", 
+        scrobbles,
+        output_file="calendar.html",
         summary=summary,
         n_items=n_items,
         n_days=n_days,
         n_peak_plays=n_peak_plays,
-        split_by_year=split_by_year
+        split_by_year=split_by_year,
+        by_time=include_time_stats
     )
     print("✓ Calendario generado: calendar.html")
+    
     # Mostrar información final
     track_per_day = ScrobblesAnalyzer.get_most_played_track_per_day(scrobbles) or {}
     print(f"  Total de días: {len(track_per_day)}")
-    print("\n🎉 Abre el archivo en tu navegador para ver el calendario interactivo")
+    print("\n🎉 Abre los archivos en tu navegador para ver los calendarios interactivos")
 
 
 if __name__ == '__main__':

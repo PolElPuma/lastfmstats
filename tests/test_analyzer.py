@@ -285,7 +285,8 @@ def test_html_generation_basic(sample_scrobbles):
                 sample_scrobbles,
                 output_file=output_file,
                 summary=None,
-                split_by_year=False
+                split_by_year=False,
+                by_time=False
             )
             
             # File should exist

@@ -4,35 +4,47 @@ Una aplicación Python para analizar tu historial de scrobbles en Last.fm con vi
 
 ## 🎯 Características
 
-- **Carga de scrobbles**: Importa archivos JSON con tu historial de Last.fm
+- **Fuentes de datos múltiples**:
+  - Carga desde archivos JSON exportados de Last.fm
+  - Descarga automática de scrobbles recientes desde la API de Last.fm
 - **Análisis estadístico completo**:
-  - Top canciones, artistas y álbumes
-  - Días con mayor actividad
+  - Top canciones, artistas y álbumes (por conteo y por tiempo total)
+  - Días con mayor actividad (por conteo y por tiempo)
   - Canciones con mayor pico de escuchas en un día
-  - Rachas de días consecutivos (para canciones, artistas y álbumes)
-- **Calendario visual interactivo**: 
+  - **Rachas mejoradas**: Días consecutivos con máximo 48 horas entre escuchas (para canciones, artistas y álbumes)
+- **Calendarios visuales interactivos**: 
+  - Calendario por conteo de reproducciones
+  - **Opción de incluir estadísticas por tiempo total** (configurable)
   - Visualiza por cada día cuál fue la canción más escuchada
   - Ver información detallada al hacer clic en cada día
   - Selector de años para análisis separado por año
   - Gráfico circular de escuchas por hora
+- **Optimización de API**:
+  - **Caché de duraciones a disco** (`data/durations.json`): Persistencia entre ejecuciones
+  - Control de rate limiting para evitar bloqueos
+  - Control de progreso durante descargas
 - **Análisis por años**: Separa automáticamente las estadísticas por año
 - **Interfaz amigable**: Aplicación CLI con opciones interactivas
 
 ## 📋 Requisitos
 
 - Python 3.9+
-- No requiere dependencias externas (usa solo librerías estándar de Python)
+- Librerías: `requests`, `beautifulsoup4` (para API y scraping limitado)
 
 ## 🚀 Instalación y Uso
 
 ### 1. Preparar datos
 
-Descarga tu historial de scrobbles desde Last.fm en formato JSON. Coloca los archivos en la carpeta `data/`:
+**Opción A: Archivo exportado**
+Descarga tu historial completo de scrobbles desde Last.fm en formato JSON. Coloca los archivos en la carpeta `data/`:
 
 ```bash
 ls data/
 # Esperado: scrobbles-USERNAME-TIMESTAMP.json
 ```
+
+**Opción B: API de Last.fm**
+La aplicación puede descargar automáticamente tus scrobbles recientes (últimos ~10,000) usando tu nombre de usuario.
 
 ### 2. Ejecutar la aplicación
 
@@ -40,14 +52,66 @@ ls data/
 python3 src/main.py
 ```
 
-La aplicación te presentará un menú interactivo:
+La aplicación te presentará un menú interactivo para seleccionar la fuente de datos y generar los calendarios.
 
-1. **Cargar archivo de scrobbles** - Selecciona el archivo JSON a analizar
-2. **Ver resumen de estadísticas** - Muestra top 20 canciones, artistas, álbumes, etc.
-3. **Buscar día pico de una canción** - Encuentra qué día escuchaste más una canción
-4. **Ver todos los días de una canción** - Historial completo de escuchas de una canción
-5. **Ver top días (escuchas globales)** - Días con más actividad general
-6. **Generar calendario visual HTML** - Crea un archivo HTML interactivo
+## 📊 Estadísticas Incluidas
+
+### Rachas Consecutivas (48h)
+A diferencia del sistema anterior que requería días calendario consecutivos exactos, el nuevo sistema permite hasta 48 horas entre escuchas. Por ejemplo:
+- Escuchar una canción el día 1 a las 23:00
+- Escucharla nuevamente el día 2 a las 01:00 (dentro de 2 horas)
+- Cuenta como días consecutivos en la racha
+
+### Calendarios Generados
+- `calendar.html`: Ordenado por número de reproducciones
+- Opcionalmente include estadísticas por tiempo total escuchado (requiere API de Last.fm para duraciones)
+
+## 💾 Caché de Duraciones
+
+El sistema incluye un caché de duraciones de canciones a disco (`data/durations.json`) que:
+
+- **Persiste entre ejecuciones**: Las duraciones se guardan automáticamente en `data/durations.json`
+- **Reduce tráfico API**: Después de la primera consulta, las duraciones se cargan instantáneamente del disco
+- **Mejora rendimiento**: Las búsquedas en caché son 1000x más rápidas que llamadas a API
+- **Automático**: No requiere configuración, funciona transparentemente
+
+### Ejemplo
+```
+Primera ejecución:  consulta duración → API Last.fm → guarda en durations.json
+Siguientes:        consulta duración → carga de durations.json (instantáneo)
+```
+
+Para limpiar el caché:
+```bash
+rm data/durations.json
+```
+
+## 👤 Caché de Scrobbles por Usuario
+
+El sistema incluye un caché inteligente de scrobbles por usuario que:
+
+- **Descarga completa**: Obtiene **todos** los scrobbles disponibles de tu historial (no limitado a 2000)
+- **Actualizaciones incrementales**: En descargas posteriores, solo obtiene scrobbles nuevos desde la última descarga
+- **Archivos separados**: Cada usuario tiene su propio archivo `data/scrobbles-USERNAME.json`
+- **Sin descargas redundantes**: Si ya tienes datos de un usuario, no vuelve a descargar todo
+
+### Cómo funciona
+```
+Primera descarga:  Descarga todos los scrobbles → guarda en scrobbles-USERNAME.json
+Descargas posteriores: Solo scrobbles nuevos desde la última fecha → actualiza el archivo
+```
+
+### Beneficios
+- **Descargas más rápidas**: Solo nuevos scrobbles en lugar de todo el historial
+- **Historial completo**: No hay límite artificial en la cantidad de scrobbles
+- **Múltiples usuarios**: Puedes analizar diferentes usuarios sin interferencias
+- **Resistente a interrupciones**: Si se interrumpe una descarga, puedes reanudar desde donde quedó
+
+Para limpiar el caché de un usuario específico:
+```bash
+rm data/scrobbles-USERNAME.json
+```
+
 7. **Salir**
 
 ### 3. Generar calendario interactivo
