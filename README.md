@@ -11,25 +11,25 @@ Una aplicación Python para analizar tu historial de scrobbles en Last.fm con vi
   - Top canciones, artistas y álbumes (por conteo y por tiempo total)
   - Días con mayor actividad (por conteo y por tiempo)
   - Canciones con mayor pico de escuchas en un día
-  - **Rachas mejoradas**: Días consecutivos con máximo 48 horas entre escuchas (para canciones, artistas y álbumes)
+  - **Regularidad**: canciones ordenadas por cobertura de días y consistencia de sus intervalos
+  - **Rachas configurables**: por días naturales consecutivos o por separación máxima en horas
 - **Calendarios visuales interactivos**: 
-  - Calendario por conteo de reproducciones
-  - **Opción de incluir estadísticas por tiempo total** (configurable)
+  - Alterna entre escuchas y tiempo directamente en cada calendario
   - Visualiza por cada día cuál fue la canción más escuchada
   - Ver información detallada al hacer clic en cada día
-  - Selector de años para análisis separado por año
+  - Selector de año o período completo; incluye las dos métricas para cada período
   - Gráfico circular de escuchas por hora
 - **Optimización de API**:
   - **Caché de duraciones a disco** (`data/durations.json`): Persistencia entre ejecuciones
   - Control de rate limiting para evitar bloqueos
   - Control de progreso durante descargas
 - **Análisis por años**: Separa automáticamente las estadísticas por año
-- **Interfaz amigable**: Aplicación CLI con opciones interactivas
+- **Interfaces**: CLI y GUI de escritorio con opciones de análisis y salida
 
 ## 📋 Requisitos
 
 - Python 3.9+
-- Librerías: `requests`, `beautifulsoup4` (para API y scraping limitado)
+- Dependencia: `requests` (para Last.fm API; los JSON locales no requieren conexión)
 
 ## 🚀 Instalación y Uso
 
@@ -49,22 +49,38 @@ La aplicación puede descargar automáticamente tus scrobbles recientes (último
 ### 2. Ejecutar la aplicación
 
 ```bash
+python3 -m pip install -r requirements.txt
 python3 src/main.py
 ```
 
 La aplicación te presentará un menú interactivo para seleccionar la fuente de datos y generar los calendarios.
 
+También puedes usar la interfaz de escritorio:
+
+```bash
+python3 src/gui.py
+```
+
+La GUI admite historial JSON o usuario Last.fm, fecha inicial opcional, cantidad de resultados, división por año, regla y separación de rachas, consulta opcional de duraciones y ruta del HTML. Por defecto, la duración se estima en 210 segundos por escucha si no está en caché; activar la consulta remota puede tardar y requiere Internet.
+
+### Crear el ejecutable Windows
+
+Consulta la guía detallada en [WINDOWS_BUILD.md](WINDOWS_BUILD.md). En Windows, también puedes ejecutar `build_windows.bat`, que compila `dist/LastFMStats.exe` con una sola ventana y sin dependencias adicionales en la máquina del usuario. La compilación debe hacerse en Windows; PyInstaller no genera ejecutables Windows desde Linux. La caché de la aplicación empaquetada se guarda en `%LOCALAPPDATA%\LastFMStats\data`.
+
 ## 📊 Estadísticas Incluidas
 
-### Rachas Consecutivas (48h)
-A diferencia del sistema anterior que requería días calendario consecutivos exactos, el nuevo sistema permite hasta 48 horas entre escuchas. Por ejemplo:
+### Rachas Consecutivas
+La GUI permite elegir entre días naturales consecutivos o un intervalo máximo configurable entre escuchas. En modo intervalo, por ejemplo:
 - Escuchar una canción el día 1 a las 23:00
 - Escucharla nuevamente el día 2 a las 01:00 (dentro de 2 horas)
 - Cuenta como días consecutivos en la racha
 
 ### Calendarios Generados
-- `calendar.html`: Ordenado por número de reproducciones
-- Opcionalmente include estadísticas por tiempo total escuchado (requiere API de Last.fm para duraciones)
+- `calendar.html`: incluye ambas métricas y permite alternarlas en el navegador
+- Duraciones exactas desde caché o Last.fm; si no, se usa una estimación de 210 segundos por escucha
+
+### Regularidad de escucha
+La puntuación de 0 a 100 combina la proporción de días activos dentro del período de la canción y la variación de los intervalos entre esos días. Una puntuación alta destaca canciones recurrentes y espaciadas de forma consistente, no simplemente las más reproducidas.
 
 ## 💾 Caché de Duraciones
 
@@ -187,7 +203,8 @@ Agrupa todas las escuchas por hora del día (0-23), mostrando:
 Ejecutar la suite de tests:
 
 ```bash
-python3 -m pytest test/test_analyzer.py -v
+python3 -m pip install pytest
+python3 -m pytest tests/ -v
 ```
 
 Tests incluyen:
@@ -204,11 +221,13 @@ lastfmstats/
 ├── src/
 │   ├── main.py                 # Punto de entrada, interfaz CLI
 │   └── load_scrobbles.py       # Core: classes Scrobble, ScrobblesLoader, ScrobblesAnalyzer
-├── test/
+├── tests/
 │   └── test_analyzer.py        # Suite de tests (16 pruebas)
 ├── data/
 │   └── scrobbles-*.json        # Archivos de datos (no incluidos en repo)
 ├── calendar.html               # Generado por la aplicación
+├── build_windows.bat           # Empaquetado de GUI para Windows
+├── requirements.txt            # Dependencias de ejecución
 └── README.md                   # Este archivo
 ```
 

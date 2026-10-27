@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import os
+from unittest.mock import patch
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
 from load_scrobbles import Scrobble, ScrobblesAnalyzer, ScrobblesLoader
+from main import calculate_complete_summary
 
 
 def make_scrobbles_sequence():
@@ -173,6 +175,14 @@ def test_empty_scrobbles_list():
     assert result2 is None or result2 == {}
 
 
+def test_utc_to_local_accepts_lastfm_and_iso_timestamps():
+    lastfm_date = ScrobblesAnalyzer._utc_to_local("01 Feb 2023, 12:00")
+    iso_date = ScrobblesAnalyzer._utc_to_local("2023-02-01T12:00:00+00:00")
+
+    assert lastfm_date is not None and iso_date is not None
+    assert lastfm_date.timestamp() == iso_date.timestamp()
+
+
 def test_single_scrobble():
     """Test analyzer with a single scrobble"""
     base = datetime(2026, 2, 1, 12, 0)
@@ -261,6 +271,56 @@ def test_multi_method_consistency(sample_scrobbles):
     
     # get_most_played_track_per_day should return a dict
     assert isinstance(ScrobblesAnalyzer.get_most_played_track_per_day(sample_scrobbles), dict)
+
+
+def test_complete_summary_and_html_include_both_metrics(sample_scrobbles):
+    summary = calculate_complete_summary(
+        sample_scrobbles, n_items=10, n_days=5, n_peak_plays=5,
+        fetch_duration_data=False, split_by_year=True
+    )
+
+    assert summary["plays"]["top_tracks"]
+    assert summary["time"]["top_tracks"]
+    assert summary["plays"]["top_tracks_regularity"]
+    assert "2026" in summary["years"]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_file = os.path.join(temp_dir, "complete_calendar.html")
+        ScrobblesAnalyzer.generate_calendar_html(
+            sample_scrobbles, output_file=output_file, summary=summary, split_by_year=True
+        )
+        with open(output_file, "r", encoding="utf-8") as html_file:
+            content = html_file.read()
+        for marker in ("trackPerDayTime", "summaryTimeData", "summaryByYearTime", "dailyTotals", "metricSelect", "yearSelect"):
+            assert marker in content
+
+
+def test_peak_time_can_differ_from_peak_play_count():
+    base = datetime(2026, 2, 1, 12, 0)
+    scrobbles = []
+    for track, count in (("Long Track", 1), ("Short Track", 3)):
+        for index in range(count):
+            timestamp = base + timedelta(minutes=index)
+            scrobbles.append(Scrobble({
+                "date": {"uts": str(int(timestamp.timestamp())), "#text": timestamp.strftime("%d %b %Y, %H:%M")},
+                "artist": {"#text": "Artist"},
+                "name": track,
+            }))
+
+    def duration_for_track(artist, track, fetch_remote=False):
+        return 700 if track == "Long Track" else 100
+
+    with patch.object(ScrobblesAnalyzer, "_get_track_duration", side_effect=duration_for_track):
+        peak_time = ScrobblesAnalyzer.get_top_tracks_by_peak_time(scrobbles, n=2)
+        hourly_time = ScrobblesAnalyzer.get_hourly_top_by_time(scrobbles, fetch_remote=False)
+
+    peak_plays = ScrobblesAnalyzer.get_top_tracks_by_peak_plays(scrobbles, n=2)
+    hourly_plays = ScrobblesAnalyzer.get_hourly_top(scrobbles)
+    assert peak_time[0][0][1] == "Long Track"
+    assert peak_plays[0][0][1] == "Short Track"
+    busiest_hour = next(hour for hour, data in hourly_plays.items() if data["total"])
+    assert hourly_time[busiest_hour]["top_track"][1] == "Long Track"
+    assert hourly_plays[busiest_hour]["top_track"][1] == "Short Track"
 
 
 def test_loader_file_loading():

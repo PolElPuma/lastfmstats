@@ -252,7 +252,10 @@ def select_include_time_stats() -> bool:
         print("❌ Por favor, ingresa 's' o 'n'")
 
 
-def calculate_summary_for_scrobbles(scrobbles: List[Scrobble], n_items: int, n_days: int, n_peak_plays: int) -> Dict[str, Any]:
+def calculate_summary_for_scrobbles(
+    scrobbles: List[Scrobble], n_items: int, n_days: int, n_peak_plays: int,
+    max_gap_hours: int = 48, interval_mode: str = "gap"
+) -> Dict[str, Any]:
     """
     Calcula un resumen de estadísticas para un conjunto de scrobbles.
     
@@ -301,10 +304,16 @@ def calculate_summary_for_scrobbles(scrobbles: List[Scrobble], n_items: int, n_d
     top_tracks_peak_plays = ScrobblesAnalyzer.get_top_tracks_by_peak_plays(scrobbles, n=n_peak_plays) or []
 
     # Top N canciones por mayor racha de días seguidos
-    top_tracks_consecutive = ScrobblesAnalyzer.get_top_tracks_by_consecutive_days(scrobbles, n=n_days) or []
+    top_tracks_consecutive = ScrobblesAnalyzer.get_top_tracks_by_consecutive_days(
+        scrobbles, n=n_days, max_gap_hours=max_gap_hours, interval_mode=interval_mode
+    ) or []
     # Top N artistas y álbumes por racha de días seguidos
-    top_artists_consecutive = ScrobblesAnalyzer.get_top_artists_by_consecutive_days(scrobbles, n=n_days) or []
-    top_albums_consecutive = ScrobblesAnalyzer.get_top_albums_by_consecutive_days(scrobbles, n=n_days) or []
+    top_artists_consecutive = ScrobblesAnalyzer.get_top_artists_by_consecutive_days(
+        scrobbles, n=n_days, max_gap_hours=max_gap_hours, interval_mode=interval_mode
+    ) or []
+    top_albums_consecutive = ScrobblesAnalyzer.get_top_albums_by_consecutive_days(
+        scrobbles, n=n_days, max_gap_hours=max_gap_hours, interval_mode=interval_mode
+    ) or []
 
     return {
         "top_tracks": top_tracks,
@@ -318,10 +327,14 @@ def calculate_summary_for_scrobbles(scrobbles: List[Scrobble], n_items: int, n_d
         "top_days": top_days,
         "top_days_most_played": top_days_most_played,
         "top_tracks_peak_plays": top_tracks_peak_plays,
+        "top_tracks_regularity": ScrobblesAnalyzer.get_top_tracks_by_regularity(scrobbles, n=n_items),
     }
 
 
-def calculate_summary_for_scrobbles_by_time(scrobbles: List[Scrobble], n_items: int, n_days: int, n_peak_plays: int) -> Dict[str, Any]:
+def calculate_summary_for_scrobbles_by_time(
+    scrobbles: List[Scrobble], n_items: int, n_days: int, n_peak_plays: int,
+    fetch_duration_data: bool = False, max_gap_hours: int = 48, interval_mode: str = "gap"
+) -> Dict[str, Any]:
     """
     Calcula un resumen de estadísticas por tiempo total para un conjunto de scrobbles.
     
@@ -334,7 +347,9 @@ def calculate_summary_for_scrobbles_by_time(scrobbles: List[Scrobble], n_items: 
     Returns:
         Diccionario con todas las estadísticas por tiempo
     """
-    top_tracks = ScrobblesAnalyzer.get_top_tracks_by_time(scrobbles, n=n_items) or []
+    top_tracks = ScrobblesAnalyzer.get_top_tracks_by_time(
+        scrobbles, n=n_items, fetch_remote=fetch_duration_data
+    ) or []
 
     # Para cada top track, obtener el día pico (por tiempo)
     track_peaks: Dict[str, Dict[str, Any]] = {}
@@ -350,16 +365,24 @@ def calculate_summary_for_scrobbles_by_time(scrobbles: List[Scrobble], n_items: 
             track_peaks[key] = {}
 
     # Top N artistas por tiempo
-    top_artists = ScrobblesAnalyzer.get_top_artists_by_time(scrobbles, n=n_items) or []
+    top_artists = ScrobblesAnalyzer.get_top_artists_by_time(
+        scrobbles, n=n_items, fetch_remote=fetch_duration_data
+    ) or []
 
     # Top N álbumes por tiempo
-    top_albums = ScrobblesAnalyzer.get_top_albums_by_time(scrobbles, n=n_items) or []
+    top_albums = ScrobblesAnalyzer.get_top_albums_by_time(
+        scrobbles, n=n_items, fetch_remote=fetch_duration_data
+    ) or []
 
     # Top N días por tiempo
-    top_days = ScrobblesAnalyzer.get_top_days_overall_by_time(scrobbles, n=n_days) or []
+    top_days = ScrobblesAnalyzer.get_top_days_overall_by_time(
+        scrobbles, n=n_days, fetch_remote=fetch_duration_data
+    ) or []
 
     # Obtener la canción más escuchada de cada uno de esos días (por tiempo)
-    most_played = ScrobblesAnalyzer.get_most_played_track_per_day_by_time(scrobbles) or {}
+    most_played = ScrobblesAnalyzer.get_most_played_track_per_day_by_time(
+        scrobbles, fetch_remote=fetch_duration_data
+    ) or {}
     top_days_most_played = {}
     for day, _ in top_days:
         if day in most_played:
@@ -368,13 +391,21 @@ def calculate_summary_for_scrobbles_by_time(scrobbles: List[Scrobble], n_items: 
         else:
             top_days_most_played[day] = ()
 
-    # Top N canciones por tiempo en su día pico (esto es más complejo, por ahora usamos el mismo)
-    top_tracks_peak_plays = ScrobblesAnalyzer.get_top_tracks_by_peak_plays(scrobbles, n=n_peak_plays) or []
+    # Top canciones por tiempo total concentrado en un solo día.
+    top_tracks_peak_plays = ScrobblesAnalyzer.get_top_tracks_by_peak_time(
+        scrobbles, n=n_peak_plays, fetch_remote=fetch_duration_data
+    ) or []
 
     # Los consecutivos no cambian
-    top_tracks_consecutive = ScrobblesAnalyzer.get_top_tracks_by_consecutive_days(scrobbles, n=n_days) or []
-    top_artists_consecutive = ScrobblesAnalyzer.get_top_artists_by_consecutive_days(scrobbles, n=n_days) or []
-    top_albums_consecutive = ScrobblesAnalyzer.get_top_albums_by_consecutive_days(scrobbles, n=n_days) or []
+    top_tracks_consecutive = ScrobblesAnalyzer.get_top_tracks_by_consecutive_days(
+        scrobbles, n=n_days, max_gap_hours=max_gap_hours, interval_mode=interval_mode
+    ) or []
+    top_artists_consecutive = ScrobblesAnalyzer.get_top_artists_by_consecutive_days(
+        scrobbles, n=n_days, max_gap_hours=max_gap_hours, interval_mode=interval_mode
+    ) or []
+    top_albums_consecutive = ScrobblesAnalyzer.get_top_albums_by_consecutive_days(
+        scrobbles, n=n_days, max_gap_hours=max_gap_hours, interval_mode=interval_mode
+    ) or []
 
     return {
         "top_tracks": top_tracks,
@@ -382,13 +413,60 @@ def calculate_summary_for_scrobbles_by_time(scrobbles: List[Scrobble], n_items: 
         "top_tracks_consecutive_days": top_tracks_consecutive,
         "top_artists_consecutive_days": top_artists_consecutive,
         "top_albums_consecutive_days": top_albums_consecutive,
-        "hourly_top": ScrobblesAnalyzer.get_hourly_top(scrobbles) or {},
+        "hourly_top": ScrobblesAnalyzer.get_hourly_top_by_time(
+            scrobbles, fetch_remote=fetch_duration_data
+        ) or {},
         "top_artists": top_artists,
         "top_albums": top_albums,
         "top_days": top_days,
         "top_days_most_played": top_days_most_played,
         "top_tracks_peak_plays": top_tracks_peak_plays,
+        "top_tracks_regularity": ScrobblesAnalyzer.get_top_tracks_by_regularity(scrobbles, n=n_items),
     }
+
+
+def calculate_complete_summary(
+    scrobbles: List[Scrobble], n_items: int, n_days: int, n_peak_plays: int,
+    fetch_duration_data: bool = False, max_gap_hours: int = 48,
+    interval_mode: str = "gap", split_by_year: bool = True
+) -> Dict[str, Any]:
+    def calculate(items: List[Scrobble]) -> Dict[str, Any]:
+        return {
+            "plays": calculate_summary_for_scrobbles(
+                items, n_items, n_days, n_peak_plays, max_gap_hours, interval_mode
+            ),
+            "time": calculate_summary_for_scrobbles_by_time(
+                items, n_items, n_days, n_peak_plays, fetch_duration_data,
+                max_gap_hours, interval_mode
+            ),
+        }
+
+    result = calculate(scrobbles)
+    result["years"] = {}
+    if split_by_year:
+        scrobbles_by_year: Dict[int, List[Scrobble]] = {}
+        for scrobble in scrobbles:
+            try:
+                year = datetime.fromtimestamp(int(scrobble.uts)).year
+            except (ValueError, TypeError, OSError):
+                continue
+            scrobbles_by_year.setdefault(year, []).append(scrobble)
+        result["years"] = {
+            str(year): calculate(items)
+            for year, items in sorted(scrobbles_by_year.items(), reverse=True)
+        }
+
+    result["_config"] = {
+        "n_items": n_items,
+        "n_days": n_days,
+        "n_peak_plays": n_peak_plays,
+        "split_by_year": split_by_year,
+        "max_gap_hours": max_gap_hours,
+        "interval_mode": interval_mode,
+        "estimated_duration_seconds": 210,
+        "duration_fetch_enabled": fetch_duration_data,
+    }
+    return result
 
 
 def main():
@@ -429,54 +507,17 @@ def main():
     # Seleccionar cantidad de días
     n_days, n_peak_plays = select_n_days()
     
-    # Seleccionar si dividir por años
-    split_by_year = select_split_by_year()
-
-    # Seleccionar si incluir estadísticas de tiempo
-    include_time_stats = select_include_time_stats()
-
-    # Calcular estadísticas
-    print("\n📊 Calculando estadísticas...")
-
-    if split_by_year:
-        # Agrupar scrobbles por año y calcular stats para cada año
-        from datetime import datetime
-        from collections import defaultdict
-
-        scrobbles_by_year: Dict[int, List[Scrobble]] = defaultdict(list)
-        for scrobble in scrobbles:
-            try:
-                year = datetime.fromtimestamp(int(scrobble.uts)).year
-            except (ValueError, TypeError):
-                year = 0
-            scrobbles_by_year[year].append(scrobble)
-
-        summary_by_year: Dict[int, Dict[str, Any]] = {}
-        for year in sorted(scrobbles_by_year.keys(), reverse=True):
-            if year == 0:
-                continue  # Saltar años inválidos
-            print(f"  📅 {year}...", end=" ", flush=True)
-            if include_time_stats:
-                summary_by_year[year] = calculate_summary_for_scrobbles_by_time(
-                    scrobbles_by_year[year],
-                    n_items, n_days, n_peak_plays
-                )
-            else:
-                summary_by_year[year] = calculate_summary_for_scrobbles(
-                    scrobbles_by_year[year],
-                    n_items, n_days, n_peak_plays
-                )
-            print("✓")
-
-        summary = summary_by_year
-    else:
-        if include_time_stats:
-            summary = calculate_summary_for_scrobbles_by_time(scrobbles, n_items, n_days, n_peak_plays)
-        else:
-            summary = calculate_summary_for_scrobbles(scrobbles, n_items, n_days, n_peak_plays)
+    # Las vistas de conteo, tiempo y año se pueden cambiar en el propio calendario.
+    max_gap_hours = 48
+    interval_mode = "gap"
+    print("\n📊 Calculando estadísticas de escuchas, tiempo y regularidad...")
+    summary = calculate_complete_summary(
+        scrobbles, n_items, n_days, n_peak_plays,
+        max_gap_hours=max_gap_hours, interval_mode=interval_mode
+    )
 
     print("✓ Estadísticas calculadas")
-    print("\n📝 Generando calendar.html con resumen...")
+    print("\n📝 Generando calendar.html con todas las vistas...")
     ScrobblesAnalyzer.generate_calendar_html(
         scrobbles,
         output_file="calendar.html",
@@ -484,8 +525,8 @@ def main():
         n_items=n_items,
         n_days=n_days,
         n_peak_plays=n_peak_plays,
-        split_by_year=split_by_year,
-        by_time=include_time_stats
+        split_by_year=True,
+        by_time=False
     )
     print("✓ Calendario generado: calendar.html")
     

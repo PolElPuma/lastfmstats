@@ -9,10 +9,20 @@ from zoneinfo import ZoneInfo
 import time
 import requests
 from functools import lru_cache
+from math import sqrt
+import sys
+
+
+def _get_application_data_dir() -> Path:
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).parent.parent / "data"
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LastFMStats" / "data"
+    return Path.home() / ".local" / "share" / "lastfmstats" / "data"
 
 # Cache para duraciones de canciones (en memoria + disco)
 _duration_cache: Dict[Tuple[str, str], int] = {}
-_cache_filepath = Path(__file__).parent.parent / "data" / "durations.json"
+_cache_filepath = _get_application_data_dir() / "durations.json"
 _api_key = 'b25b959554ed76058ac220b7b2e0a026'  # API key de Last.fm (debería ser configurable)
 
 # Cache para scrobbles por usuario (solo disco)
@@ -64,7 +74,7 @@ def _save_duration_cache() -> None:
 
 def _get_user_scrobbles_filepath(username: str) -> Path:
     """Obtiene la ruta del archivo de caché para un usuario."""
-    return Path(__file__).parent.parent / "data" / f"scrobbles-{username}.json"
+    return _get_application_data_dir() / f"scrobbles-{username}.json"
 
 
 def _load_user_scrobbles_cache(username: str) -> List[Dict[str, Any]]:
@@ -446,7 +456,7 @@ class ScrobblesAnalyzer:
             return None
     
     @staticmethod
-    def _get_track_duration(artist: str, track: str) -> Optional[int]:
+    def _get_track_duration(artist: str, track: str, fetch_remote: bool = True) -> Optional[int]:
         """
         Obtiene la duración de una canción desde caché o la API de Last.fm
         
@@ -472,6 +482,9 @@ class ScrobblesAnalyzer:
             if (cached_key[0].lower(), cached_key[1].lower()) == key_lower:
                 _duration_cache[key] = duration  # Actualizar caché con la clave exacta
                 return duration
+
+        if not fetch_remote:
+            return None
 
         _track_duration_calls += 1
         _enforce_api_rate_limit()
@@ -612,14 +625,52 @@ class ScrobblesAnalyzer:
         tracks = [(str(s.artist), str(s.track)) for s in filtered if s.track]
         counter = Counter(tracks)
         # Retornar con copias explícitas para máxima seguridad
-        return [((str(artist), str(track)), int(count)) for (artist, track), count in counter.most_common(n)]
+        ordered = sorted(counter.items(), key=lambda item: (-item[1], item[0][0].casefold(), item[0][1].casefold()))
+        return [((str(artist), str(track)), int(count)) for (artist, track), count in ordered[:n]]
+
+    @staticmethod
+    def get_top_tracks_by_regularity(
+        scrobbles: List[Scrobble],
+        n: int = 10,
+        min_plays: int = 5
+    ) -> List[Tuple[Tuple[str, str], float, int, int, int]]:
+        """Ordena canciones por cobertura de escucha y regularidad de sus intervalos."""
+        track_dates: Dict[Tuple[str, str], List[datetime]] = defaultdict(list)
+        for scrobble in scrobbles:
+            local_dt = ScrobblesAnalyzer._utc_to_local(scrobble.utc_time)
+            if local_dt and scrobble.artist and scrobble.track:
+                track_dates[(scrobble.artist, scrobble.track)].append(local_dt)
+
+        results = []
+        for key, timestamps in track_dates.items():
+            distinct_dates = sorted({timestamp.date() for timestamp in timestamps})
+            if len(timestamps) < min_plays or len(distinct_dates) < 2:
+                continue
+
+            span_days = (distinct_dates[-1] - distinct_dates[0]).days + 1
+            coverage = len(distinct_dates) / span_days
+            gaps = [(right - left).days for left, right in zip(distinct_dates, distinct_dates[1:])]
+            mean_gap = sum(gaps) / len(gaps)
+            gap_variation = sqrt(sum((gap - mean_gap) ** 2 for gap in gaps) / len(gaps)) / mean_gap
+            score = round(100 * coverage / (1 + gap_variation), 1)
+            results.append((key, score, len(distinct_dates), span_days, len(timestamps)))
+
+        results.sort(key=lambda item: (-item[1], -item[2], item[0][0].casefold(), item[0][1].casefold()))
+        return results[:n]
+
+    @staticmethod
+    def _streak_continues(previous: datetime, current: datetime, max_gap_hours: int, interval_mode: str) -> bool:
+        if interval_mode == "calendar":
+            return (current.date() - previous.date()).days <= 1
+        return (current - previous).total_seconds() <= max_gap_hours * 3600
     
     @staticmethod
     def get_top_artists_by_time(
         scrobbles: List[Scrobble],
         n: int = 10,
         from_date: Optional[str] = None,
-        to_date: Optional[str] = None
+        to_date: Optional[str] = None,
+        fetch_remote: bool = True
     ) -> List[Tuple[str, int]]:
         """
         Obtiene los n artistas más escuchados por tiempo total
@@ -638,9 +689,8 @@ class ScrobblesAnalyzer:
         
         for s in filtered:
             if s.artist and s.track:
-                duration = ScrobblesAnalyzer._get_track_duration(s.artist, s.track)
-                if duration:
-                    artist_times[s.artist] += duration
+                duration = ScrobblesAnalyzer._get_track_duration(s.artist, s.track, fetch_remote) or 210
+                artist_times[s.artist] += duration
         
         return sorted(artist_times.items(), key=lambda x: x[1], reverse=True)[:n]
     
@@ -649,7 +699,8 @@ class ScrobblesAnalyzer:
         scrobbles: List[Scrobble],
         n: int = 10,
         from_date: Optional[str] = None,
-        to_date: Optional[str] = None
+        to_date: Optional[str] = None,
+        fetch_remote: bool = True
     ) -> List[Tuple[Tuple[str, str], int]]:
         """
         Obtiene los n álbumes más escuchados por tiempo total
@@ -668,9 +719,8 @@ class ScrobblesAnalyzer:
         
         for s in filtered:
             if s.album and s.track:
-                duration = ScrobblesAnalyzer._get_track_duration(s.artist, s.track)
-                if duration:
-                    album_times[(s.artist, s.album)] += duration
+                duration = ScrobblesAnalyzer._get_track_duration(s.artist, s.track, fetch_remote) or 210
+                album_times[(s.artist, s.album)] += duration
         
         return sorted(album_times.items(), key=lambda x: x[1], reverse=True)[:n]
     
@@ -679,7 +729,8 @@ class ScrobblesAnalyzer:
         scrobbles: List[Scrobble],
         n: int = 10,
         from_date: Optional[str] = None,
-        to_date: Optional[str] = None
+        to_date: Optional[str] = None,
+        fetch_remote: bool = True
     ) -> List[Tuple[Tuple[str, str], int]]:
         """
         Obtiene las n canciones más escuchadas por tiempo total
@@ -698,11 +749,9 @@ class ScrobblesAnalyzer:
         
         for s in filtered:
             if s.track:
-                duration = ScrobblesAnalyzer._get_track_duration(s.artist, s.track)
-                if duration:
-                    # Usar copias explícitas de strings como claves
-                    key = (str(s.artist), str(s.track))
-                    track_times[key] += duration
+                duration = ScrobblesAnalyzer._get_track_duration(s.artist, s.track, fetch_remote) or 210
+                key = (str(s.artist), str(s.track))
+                track_times[key] += duration
         
         # Retornar con copias explícitas para máxima seguridad
         result = sorted(track_times.items(), key=lambda x: x[1], reverse=True)[:n]
@@ -721,35 +770,18 @@ class ScrobblesAnalyzer:
         """
         if not utc_time_str:
             return None
-        
+
         try:
-            # Parsear la fecha en UTC
             dt_utc = datetime.strptime(utc_time_str, "%d %b %Y, %H:%M").replace(tzinfo=timezone.utc)
-            
-            # Convertir a zona horaria local del sistema
-            local_tz = ZoneInfo("UTC")  # Por defecto, obtener la zona local
+        except ValueError:
             try:
-                import time
-                if time.daylight:
-                    local_tz = ZoneInfo("UTC")
-                # Intentar usar la zona horaria del sistema
-                from datetime import datetime as dt_now
-                local_now = dt_now.now(tz=None)
-                if hasattr(local_now, 'astimezone'):
-                    local_tz = local_now.astimezone().tzinfo
-            except:
-                pass
-            
-            # Mejor: usar una aproximación más simple - obtener UTC offset del sistema
-            offset = datetime.now(timezone.utc).astimezone().utcoffset()
-            if offset is not None:
-                local_tz = timezone(offset)
-            
-            dt_local = dt_utc.astimezone(local_tz)
-            return dt_local
-            
-        except (ValueError, Exception):
-            return None
+                dt_utc = datetime.fromisoformat(utc_time_str.replace("Z", "+00:00"))
+                if dt_utc.tzinfo is None:
+                    dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+            except ValueError:
+                return None
+
+        return dt_utc.astimezone()
     
     @staticmethod
     def get_peak_day_for_track(
@@ -878,7 +910,8 @@ class ScrobblesAnalyzer:
     @staticmethod
     def get_top_days_overall_by_time(
         scrobbles: List[Scrobble],
-        n: int = 10
+        n: int = 10,
+        fetch_remote: bool = True
     ) -> Optional[List[Tuple[str, int]]]:
         """
         Obtiene los n días con más tiempo escuchado en total (globales)
@@ -901,9 +934,8 @@ class ScrobblesAnalyzer:
             
             if local_dt:
                 day_key = local_dt.strftime("%d %b %Y")
-                duration = ScrobblesAnalyzer._get_track_duration(scrobble.artist, scrobble.track)
-                if duration:
-                    day_times[day_key] += duration
+                duration = ScrobblesAnalyzer._get_track_duration(scrobble.artist, scrobble.track, fetch_remote) or 210
+                day_times[day_key] += duration
         
         if not day_times:
             return None
@@ -1025,11 +1057,14 @@ class ScrobblesAnalyzer:
             if track_counts:
                 (artist, track), count = track_counts.most_common(1)[0]
                 
-                # Buscar el scrobble para obtener metadatos
-                day_scrobbles = [
-                    s for s in scrobbles
-                    if s.artist == artist and s.track == track
-                ]
+                # Los metadatos deben proceder del mismo día que la agregación.
+                day_scrobbles = []
+                for scrobble in scrobbles:
+                    if scrobble.artist != artist or scrobble.track != track:
+                        continue
+                    local_dt = ScrobblesAnalyzer._utc_to_local(scrobble.utc_time)
+                    if local_dt and local_dt.strftime("%d %b %Y") == day:
+                        day_scrobbles.append(scrobble)
                 
                 if day_scrobbles:
                     scrobble = day_scrobbles[0]
@@ -1050,7 +1085,8 @@ class ScrobblesAnalyzer:
     
     @staticmethod
     def get_most_played_track_per_day_by_time(
-        scrobbles: List[Scrobble]
+        scrobbles: List[Scrobble],
+        fetch_remote: bool = True
     ) -> Optional[Dict[str, Tuple[str, str, str, str, int]]]:
         """
         Obtiene para cada día la canción más escuchada por tiempo total
@@ -1074,9 +1110,8 @@ class ScrobblesAnalyzer:
             if local_dt:
                 day_key = local_dt.strftime("%d %b %Y")
                 track_key = (scrobble.artist, scrobble.track)
-                duration = ScrobblesAnalyzer._get_track_duration(scrobble.artist, scrobble.track)
-                if duration:
-                    day_tracks[day_key][track_key] += duration
+                duration = ScrobblesAnalyzer._get_track_duration(scrobble.artist, scrobble.track, fetch_remote) or 210
+                day_tracks[day_key][track_key] += duration
         
         if not day_tracks:
             return None
@@ -1090,10 +1125,13 @@ class ScrobblesAnalyzer:
                 artist, track = track_key
                 
                 # Buscar el scrobble para obtener metadatos
-                day_scrobbles = [
-                    s for s in scrobbles
-                    if s.artist == artist and s.track == track
-                ]
+                day_scrobbles = []
+                for scrobble in scrobbles:
+                    if scrobble.artist != artist or scrobble.track != track:
+                        continue
+                    local_dt = ScrobblesAnalyzer._utc_to_local(scrobble.utc_time)
+                    if local_dt and local_dt.strftime("%d %b %Y") == day:
+                        day_scrobbles.append(scrobble)
                 
                 if day_scrobbles:
                     scrobble = day_scrobbles[0]
@@ -1160,9 +1198,35 @@ class ScrobblesAnalyzer:
         return result[:n] if result else None
 
     @staticmethod
+    def get_top_tracks_by_peak_time(
+        scrobbles: List[Scrobble],
+        n: int = 5,
+        fetch_remote: bool = False
+    ) -> Optional[List[Tuple[Tuple[str, str], int, str]]]:
+        """Devuelve las canciones con más tiempo estimado en un solo día."""
+        track_day_times: Dict[Tuple[str, str], Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for scrobble in scrobbles:
+            local_dt = ScrobblesAnalyzer._utc_to_local(scrobble.utc_time)
+            if not local_dt or not scrobble.track:
+                continue
+            duration = ScrobblesAnalyzer._get_track_duration(
+                scrobble.artist, scrobble.track, fetch_remote
+            ) or 210
+            track_day_times[(scrobble.artist, scrobble.track)][local_dt.strftime("%d %b %Y")] += duration
+
+        peaks = []
+        for track_key, day_times in track_day_times.items():
+            peak_day, seconds = max(day_times.items(), key=lambda item: item[1])
+            peaks.append((track_key, seconds, peak_day))
+        peaks.sort(key=lambda item: (-item[1], item[0][0].casefold(), item[0][1].casefold()))
+        return peaks[:n] or None
+
+    @staticmethod
     def get_top_tracks_by_consecutive_days(
         scrobbles: List[Scrobble],
-        n: int = 5
+        n: int = 5,
+        max_gap_hours: int = 48,
+        interval_mode: str = "gap"
     ) -> Optional[List[Tuple[Tuple[str, str], int, str, str]]]:
         """
         Obtiene las N canciones que se escucharon en más días seguidos (racha más larga).
@@ -1210,8 +1274,8 @@ class ScrobblesAnalyzer:
             current_start = None
 
             for i, ts in enumerate(timestamps_sorted):
-                # Si es el primer o está dentro de 48 horas del último en la racha actual
-                if not current_streak_days or (ts - max(current_streak_days, key=lambda x: x)).total_seconds() <= 48 * 3600:
+                previous = max(current_streak_days, key=lambda x: x) if current_streak_days else None
+                if previous is None or ScrobblesAnalyzer._streak_continues(previous, ts, max_gap_hours, interval_mode):
                     current_streak_days.add(ts)
                     if current_start is None:
                         current_start = ts
@@ -1248,7 +1312,9 @@ class ScrobblesAnalyzer:
     @staticmethod
     def get_top_artists_by_consecutive_days(
         scrobbles: List[Scrobble],
-        n: int = 5
+        n: int = 5,
+        max_gap_hours: int = 48,
+        interval_mode: str = "gap"
     ) -> Optional[List[Tuple[str, int, str, str]]]:
         """
         Obtiene las N artistas que se escucharon en más días seguidos (racha más larga).
@@ -1291,7 +1357,8 @@ class ScrobblesAnalyzer:
             current_start = None
 
             for i, ts in enumerate(timestamps_sorted):
-                if not current_streak_days or (ts - max(current_streak_days, key=lambda x: x)).total_seconds() <= 48 * 3600:
+                previous = max(current_streak_days, key=lambda x: x) if current_streak_days else None
+                if previous is None or ScrobblesAnalyzer._streak_continues(previous, ts, max_gap_hours, interval_mode):
                     current_streak_days.add(ts)
                     if current_start is None:
                         current_start = ts
@@ -1323,7 +1390,9 @@ class ScrobblesAnalyzer:
     @staticmethod
     def get_top_albums_by_consecutive_days(
         scrobbles: List[Scrobble],
-        n: int = 5
+        n: int = 5,
+        max_gap_hours: int = 48,
+        interval_mode: str = "gap"
     ) -> Optional[List[Tuple[Tuple[str, str], int, str, str]]]:
         """
         Obtiene las N parejas (artista, álbum) que se escucharon en más días seguidos.
@@ -1366,7 +1435,8 @@ class ScrobblesAnalyzer:
             current_start = None
 
             for i, ts in enumerate(timestamps_sorted):
-                if not current_streak_days or (ts - max(current_streak_days, key=lambda x: x)).total_seconds() <= 48 * 3600:
+                previous = max(current_streak_days, key=lambda x: x) if current_streak_days else None
+                if previous is None or ScrobblesAnalyzer._streak_continues(previous, ts, max_gap_hours, interval_mode):
                     current_streak_days.add(ts)
                     if current_start is None:
                         current_start = ts
@@ -1447,6 +1517,43 @@ class ScrobblesAnalyzer:
         return result
 
     @staticmethod
+    def get_hourly_top_by_time(
+        scrobbles: List[Scrobble],
+        fetch_remote: bool = False
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Calcula la distribución horaria ponderada por duración de escucha."""
+        if not scrobbles:
+            return None
+
+        hour_totals = defaultdict(int)
+        hour_artists = defaultdict(Counter)
+        hour_tracks = defaultdict(Counter)
+        for scrobble in scrobbles:
+            local_dt = ScrobblesAnalyzer._utc_to_local(scrobble.utc_time)
+            if not local_dt:
+                continue
+            duration = ScrobblesAnalyzer._get_track_duration(
+                scrobble.artist, scrobble.track, fetch_remote
+            ) or 210
+            hour = local_dt.hour
+            hour_totals[hour] += duration
+            if scrobble.artist:
+                hour_artists[hour][scrobble.artist] += duration
+            if scrobble.track:
+                hour_tracks[hour][(scrobble.artist, scrobble.track)] += duration
+
+        result = {}
+        for hour in range(24):
+            top_artist = hour_artists[hour].most_common(1)
+            top_track = hour_tracks[hour].most_common(1)
+            result[str(hour)] = {
+                "total": hour_totals[hour],
+                "top_artist": (top_artist[0][0], top_artist[0][1]) if top_artist else (),
+                "top_track": (*top_track[0][0], top_track[0][1]) if top_track else (),
+            }
+        return result
+
+    @staticmethod
     # Fin de la clase ScrobblesAnalyzer (lógica de búsqueda/descarga de imágenes eliminada)
     
     @staticmethod
@@ -1474,62 +1581,106 @@ class ScrobblesAnalyzer:
             split_by_year: Si True, agrupa análisis por año
             by_time: Si True, las estadísticas son por tiempo total en lugar de conteo
         """
-        track_per_day = ScrobblesAnalyzer.get_most_played_track_per_day_by_time(scrobbles) if by_time else ScrobblesAnalyzer.get_most_played_track_per_day(scrobbles)
-        
-        if not track_per_day:
+        track_per_day = ScrobblesAnalyzer.get_most_played_track_per_day(scrobbles) or {}
+        track_per_day_time = ScrobblesAnalyzer.get_most_played_track_per_day_by_time(
+            scrobbles, fetch_remote=False
+        ) or {}
+
+        daily_totals = {"plays": defaultdict(int), "time": defaultdict(int)}
+        for scrobble in scrobbles:
+            local_dt = ScrobblesAnalyzer._utc_to_local(scrobble.utc_time)
+            if not local_dt:
+                continue
+            day = local_dt.strftime("%d %b %Y")
+            daily_totals["plays"][day] += 1
+            duration = ScrobblesAnalyzer._get_track_duration(
+                scrobble.artist, scrobble.track, fetch_remote=False
+            ) or 210
+            daily_totals["time"][day] += duration
+
+        if not track_per_day and not track_per_day_time:
             print("No hay datos para generar calendario")
             return
 
-        # Agrupar track_per_day por año
-        track_by_year: Dict[int, Dict[str, Any]] = defaultdict(dict)
-        for date_str, info in (track_per_day or {}).items():
-            try:
-                dt = datetime.strptime(date_str, "%d %b %Y")
-                year = dt.year
-            except Exception:
-                year = 0
-            track_by_year[year][date_str] = info
-        
-        # Determinar si summary es por años o global
-        summary_is_by_year = split_by_year and summary and isinstance(summary, dict) and \
-                           all(isinstance(v, dict) and 'top_tracks' in v for v in (list(summary.values())[:1]))
-        
-        if summary_is_by_year:
-            # summary es {2021: {...stats...}, 2022: {...stats...}, ...}
-            summary_by_year = summary
-            # Para usar en el summary global (si es necesario), tomar el primer año
-            summary_with_config = (summary_by_year.get(max(summary_by_year.keys())) or {}).copy() if summary_by_year else {}
+        def group_days_by_year(days: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+            grouped: Dict[int, Dict[str, Any]] = defaultdict(dict)
+            for date_str, info in days.items():
+                try:
+                    year = datetime.strptime(date_str, "%d %b %Y").year
+                except ValueError:
+                    continue
+                grouped[year][date_str] = info
+            return grouped
+
+        track_by_year = group_days_by_year(track_per_day)
+        track_by_year_time = group_days_by_year(track_per_day_time)
+        daily_totals_by_year = {
+            metric: group_days_by_year(totals)
+            for metric, totals in daily_totals.items()
+        }
+
+        complete_summary = isinstance(summary, dict) and "plays" in summary and "time" in summary
+        if complete_summary:
+            summary_with_config = dict(summary.get("plays") or {})
+            summary_time_with_config = dict(summary.get("time") or {})
+            summary_by_year = {
+                str(year): dict(year_summary.get("plays") or {})
+                for year, year_summary in (summary.get("years") or {}).items()
+            }
+            summary_by_year_time = {
+                str(year): dict(year_summary.get("time") or {})
+                for year, year_summary in (summary.get("years") or {}).items()
+            }
+            config = dict(summary.get("_config") or {})
+        elif isinstance(summary, dict) and summary and all(
+            isinstance(year_summary, dict) and "top_tracks" in year_summary
+            for year_summary in summary.values()
+        ):
+            summary_by_year = {
+                str(year): dict(year_summary)
+                for year, year_summary in summary.items()
+            }
+            latest_year = max(summary_by_year)
+            summary_with_config = dict(summary_by_year[latest_year])
+            summary_time_with_config = {}
+            summary_by_year_time = {}
+            config = {}
         else:
-            # summary es un dict normal de stats
-            summary_with_config = (summary or {}).copy()
+            summary_with_config = dict(summary or {})
+            summary_time_with_config = {}
             summary_by_year = {}
-        
+            summary_by_year_time = {}
+            config = {}
+
         config = {
+            **config,
             'n_items': n_items,
             'n_days': n_days,
             'n_peak_plays': n_peak_plays,
             'split_by_year': split_by_year,
             'cards_per_page': cards_per_page
         }
-        
         summary_with_config['_config'] = config
-        
-        # Incluir datos por hora si no están en el resumen
         if 'hourly_top' not in summary_with_config:
             summary_with_config['hourly_top'] = ScrobblesAnalyzer.get_hourly_top(scrobbles) or {}
-        
-        # Añadir configuración a cada resumen por año
-        if summary_by_year:
-            for year in summary_by_year:
-                if isinstance(summary_by_year[year], dict):
-                    summary_by_year[year]['_config'] = config
-        
+
+        summary_time_with_config['_config'] = config
+        if 'hourly_top' not in summary_time_with_config:
+            summary_time_with_config['hourly_top'] = summary_with_config['hourly_top']
+        for year in summary_by_year:
+            summary_by_year[year]['_config'] = config
+            summary_by_year_time[year]['_config'] = config
+
         track_json = json.dumps(track_per_day, ensure_ascii=False)
         track_by_year_json = json.dumps(track_by_year, ensure_ascii=False)
+        track_time_json = json.dumps(track_per_day_time, ensure_ascii=False)
+        track_by_year_time_json = json.dumps(track_by_year_time, ensure_ascii=False)
+        daily_totals_json = json.dumps(daily_totals, ensure_ascii=False)
+        daily_totals_by_year_json = json.dumps(daily_totals_by_year, ensure_ascii=False)
         summary_json = json.dumps(summary_with_config, ensure_ascii=False)
-        
-        # Serializar summary por años si están disponibles
+        summary_time_json = json.dumps(summary_time_with_config, ensure_ascii=False)
         summary_by_year_json = json.dumps(summary_by_year, ensure_ascii=False) if summary_by_year else "{}"
+        summary_by_year_time_json = json.dumps(summary_by_year_time, ensure_ascii=False) if summary_by_year_time else "{}"
 
         # Crear HTML
         title_suffix = " (por Tiempo)" if by_time else ""
@@ -1792,7 +1943,7 @@ class ScrobblesAnalyzer:
         <div id="hourly-chart-container" style="margin:18px 0 28px; display:flex; gap:18px; align-items:center; justify-content:center;">
             <canvas id="hourChart" width="360" height="360" style="width:360px; height:360px; flex:0 0 360px; background:transparent; border-radius:8px;"></canvas>
             <div id="hourInfo" style="color:white; width:420px; font-size:0.95em; flex:0 0 420px;">
-                <h3 style="margin-bottom:6px;">Distribucion Horaria</h3>
+                <h3 id="hourTitle" style="margin-bottom:6px;">Distribución horaria</h3>
                 <div id="hourDetail">Pasa el ratón sobre el gráfico para ver el artista y la canción más escuchados en esa hora.</div>
             </div>
         </div>
@@ -1801,7 +1952,7 @@ class ScrobblesAnalyzer:
         
         <div class="stats">
             <p>Total de días: <strong id="totalDays">0</strong></p>
-            <p>Total de escuchas: <strong id="totalPlays">0</strong></p>
+            <p><span id="totalMetricLabel">Total de escuchas:</span> <strong id="totalPlays">0</strong></p>
         </div>
     </div>
     
@@ -1820,14 +1971,29 @@ class ScrobblesAnalyzer:
     <script>
         const trackPerDay = """ + track_json + """;
         const trackByYear = """ + track_by_year_json + """;
+        const trackPerDayTime = """ + track_time_json + """;
+        const trackByYearTime = """ + track_by_year_time_json + """;
+        const dailyTotals = """ + daily_totals_json + """;
+        const dailyTotalsByYear = """ + daily_totals_by_year_json + """;
         let summaryData = """ + summary_json + """;
+        const summaryTimeData = """ + summary_time_json + """;
         const summaryByYear = """ + summary_by_year_json + """;
+        const summaryByYearTime = """ + summary_by_year_time_json + """;
+        let currentMetric = """ + json.dumps("time" if by_time else "plays") + """;
+
+        function formatMetricValue(value) {
+            if (currentMetric !== 'time') return Number(value || 0).toLocaleString('es-ES') + ' escuchas';
+            const seconds = Number(value || 0);
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            return hours ? hours + ' h ' + minutes + ' min' : minutes + ' min';
+        }
 
         function openModal(date, artist, track, imageUrl, url, plays) {
             document.getElementById('modalDate').textContent = date;
             document.getElementById('modalArtist').textContent = artist;
             document.getElementById('modalTrack').textContent = track;
-            document.getElementById('modalPlays').textContent = plays + ' escuchas';
+            document.getElementById('modalPlays').textContent = formatMetricValue(plays);
             const modalImg = document.getElementById('modalImage');
             modalImg.src = imageUrl || '';
             document.getElementById('modalLink').href = url || '#';
@@ -1838,7 +2004,7 @@ class ScrobblesAnalyzer:
             document.getElementById('modal').classList.remove('show');
         }
 
-        function renderCalendarFromData(data) {
+        function renderCalendarFromData(data, totals) {
             const calendar = document.getElementById('calendar');
             calendar.innerHTML = '';
             const dates = Object.keys(data).sort((a,b)=> new Date(b.split(' ').reverse().join(' ')) - new Date(a.split(' ').reverse().join(' ')));
@@ -1847,7 +2013,8 @@ class ScrobblesAnalyzer:
                 const info = data[date];
                 if (!info) continue;
                 const [artist, track, imageUrl, url, plays] = info;
-                totalDays++; totalPlays += plays || 0;
+                const dayTotal = (totals && totals[date]) || plays || 0;
+                totalDays++; totalPlays += dayTotal;
 
                 const card = document.createElement('div'); card.className = 'day-card';
                 const googleSearchUrl = 'https://www.google.com/search?q=' + encodeURIComponent(artist + ' ' + track) + '&tbm=isch';
@@ -1860,22 +2027,29 @@ class ScrobblesAnalyzer:
                     const placeholder = document.createElement('div'); placeholder.className='day-image no-image'; placeholder.innerHTML='Buscar en Google'; placeholder.onclick = ()=> window.open(googleSearchUrl,'_blank'); imgWrapper.appendChild(placeholder);
                 }
                 const infoDiv = document.createElement('div'); infoDiv.className='day-info';
-                infoDiv.innerHTML = '<div class="day-artist">' + (artist||'') + '</div><div class="day-track">' + (track||'') + '</div><div class="day-plays">' + (plays||0) + ' escuchas</div>';
+                infoDiv.innerHTML = '<div class="day-artist">' + (artist||'') + '</div><div class="day-track">' + (track||'') + '</div><div class="day-plays">Día: ' + formatMetricValue(dayTotal) + '</div>';
                 const dateDiv = document.createElement('div'); dateDiv.className='day-date'; dateDiv.textContent = date;
                 card.appendChild(dateDiv); card.appendChild(imgWrapper); card.appendChild(infoDiv);
                 card.onclick = ()=> openModal(date, artist, track, imageUrl, url, plays||0);
                 calendar.appendChild(card);
             }
             document.getElementById('totalDays').textContent = totalDays;
-            document.getElementById('totalPlays').textContent = totalPlays;
+            document.getElementById('totalPlays').textContent = formatMetricValue(totalPlays);
+            document.getElementById('totalMetricLabel').textContent = currentMetric === 'time' ? 'Tiempo total:' : 'Total de escuchas:';
         }
 
-        function renderCalendarAllDays(){ renderCalendarFromData(trackPerDay||{}); }
+        function renderCalendarAllDays(){
+            renderCalendarFromData(
+                currentMetric === 'time' ? trackPerDayTime : trackPerDay,
+                dailyTotals[currentMetric]
+            );
+        }
 
         function renderCalendarForYearSimple(year){
             if (year !== null && year !== undefined) {
-                const data = trackByYear[String(year)] || {};
-                renderCalendarFromData(data);
+                const yearData = currentMetric === 'time' ? trackByYearTime : trackByYear;
+                const data = yearData[String(year)] || {};
+                renderCalendarFromData(data, dailyTotalsByYear[currentMetric][String(year)] || {});
             } else {
                 renderCalendarAllDays();
             }
@@ -1883,6 +2057,7 @@ class ScrobblesAnalyzer:
 
         function renderHourlyChart(hourly){
             if (!hourly) return;
+            document.getElementById('hourTitle').textContent = currentMetric === 'time' ? 'Tiempo escuchado por hora' : 'Escuchas por hora';
             const canvas = document.getElementById('hourChart'); if (!canvas || !canvas.getContext) return;
             const ctx = canvas.getContext('2d'); const w = canvas.width, h = canvas.height; ctx.clearRect(0,0,w,h);
             const totals = []; for (let i=0;i<24;i++){ totals.push((hourly[String(i)]&&hourly[String(i)].total)||0); }
@@ -1890,7 +2065,7 @@ class ScrobblesAnalyzer:
             let start = -Math.PI/2; const radius = Math.min(w,h)*0.38;
             for (let i=0;i<24;i++){ const val = totals[i]; const angle = val/sum*Math.PI*2; const end = start+angle; ctx.beginPath(); ctx.moveTo(w/2,h/2); ctx.fillStyle='hsl('+Math.round(i*(360/24))+',70%,60%)'; ctx.arc(w/2,h/2,radius,start,end); ctx.closePath(); ctx.fill(); start = end; }
             // interactivity
-            let lastHour = null; canvas.onmousemove = function(ev){ const rect = canvas.getBoundingClientRect(); const x = ev.clientX-rect.left-w/2; const y = ev.clientY-rect.top-h/2; const ang = Math.atan2(y,x); let a = ang-(-Math.PI/2); if (a<0) a+=Math.PI*2; let acc=0; let hour=0; for (let i=0;i<24;i++){ const slice = totals[i]/sum*Math.PI*2; if (a>=acc && a<acc+slice){ hour=i; break;} acc+=slice;} if (hour===lastHour) return; lastHour=hour; const info = hourly[String(hour)]||{}; const detail = document.getElementById('hourDetail'); let html = '<strong>Hora: '+hour+':00</strong><br/>Total escuchas: <strong>'+(info.total||0)+'</strong><br/>'; if (info.top_artist) html += 'Top artista: <strong>'+info.top_artist[0]+'</strong> ('+info.top_artist[1]+')<br/>'; if (info.top_track) html += 'Top canción: <strong>'+ (info.top_track[1]||'') +'</strong> — '+(info.top_track[0]||'')+' ('+(info.top_track[2]||0)+')<br/>'; detail.innerHTML = html; };
+            let lastHour = null; canvas.onmousemove = function(ev){ const rect = canvas.getBoundingClientRect(); const x = ev.clientX-rect.left-w/2; const y = ev.clientY-rect.top-h/2; const ang = Math.atan2(y,x); let a = ang-(-Math.PI/2); if (a<0) a+=Math.PI*2; let acc=0; let hour=0; for (let i=0;i<24;i++){ const slice = totals[i]/sum*Math.PI*2; if (a>=acc && a<acc+slice){ hour=i; break;} acc+=slice;} if (hour===lastHour) return; lastHour=hour; const info = hourly[String(hour)]||{}; const detail = document.getElementById('hourDetail'); let html = '<strong>Hora: '+hour+':00</strong><br/>Total: <strong>'+formatMetricValue(info.total)+'</strong><br/>'; if (info.top_artist) html += 'Top artista: <strong>'+info.top_artist[0]+'</strong> ('+formatMetricValue(info.top_artist[1])+')<br/>'; if (info.top_track) html += 'Top canción: <strong>'+ (info.top_track[1]||'') +'</strong> — '+(info.top_track[0]||'')+' ('+formatMetricValue(info.top_track[2])+')<br/>'; detail.innerHTML = html; };
             canvas.onclick = function(ev){ const rect = canvas.getBoundingClientRect(); const x = ev.clientX-rect.left-w/2; const y = ev.clientY-rect.top-h/2; const ang = Math.atan2(y,x); let a = ang-(-Math.PI/2); if (a<0) a+=Math.PI*2; let acc=0; let hour=0; for (let i=0;i<24;i++){ const slice = totals[i]/sum*Math.PI*2; if (a>=acc && a<acc+slice){ hour=i; break;} acc+=slice;} const info = hourly[String(hour)]||{}; const tt = info.top_track||[]; if (tt && tt.length>=3){ openModal(hour+':00', tt[0], tt[1], '', '#', tt[2]); } };
         }
 
@@ -1901,7 +2076,7 @@ class ScrobblesAnalyzer:
             const n_peak = (summary._config && summary._config.n_peak_plays) || 5;
             
             let html = '<div class="stats" style="margin-bottom:18px; text-align:left;">';
-            html += '<h2 style="margin-bottom:20px; text-align:center; color:#667eea; border-bottom:2px solid #667eea; padding-bottom:10px;">RESUMEN DE ESTADISTICAS</h2>';
+            html += '<h2 style="margin-bottom:20px; text-align:center; color:#667eea; border-bottom:2px solid #667eea; padding-bottom:10px;">RESUMEN: '+(currentMetric === 'time' ? 'TIEMPO ESCUCHADO' : 'REPRODUCCIONES')+'</h2>';
             
             // Top tracks
             const tt = summary.top_tracks||[];
@@ -1911,7 +2086,7 @@ class ScrobblesAnalyzer:
                     const artist = item[0][0]||'';
                     const track = item[0][1]||'';
                     const plays = item[1]||0;
-                    html += '<li><strong style="font-size:1.05em; color:#333;">'+track+'</strong><br/><small style="color:#999;">por '+artist+'</small> <span style="color:#999;">('+plays+')</span></li>';
+                    html += '<li><strong style="font-size:1.05em; color:#333;">'+track+'</strong><br/><small style="color:#999;">por '+artist+'</small> <span style="color:#999;">('+formatMetricValue(plays)+')</span></li>';
                 }
                 html += '</ol></div>';
             }
@@ -1921,7 +2096,7 @@ class ScrobblesAnalyzer:
             if (ta.length>0){
                 html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #764ba2; border-radius:4px;"><strong style="color:#764ba2;">TOP '+n_items+' ARTISTAS</strong><ol style="margin:8px 0 0 20px;">';
                 for (let item of ta){
-                    html += '<li><strong>'+item[0]+'</strong> <span style="color:#999;">('+item[1]+' escuchas)</span></li>';
+                    html += '<li><strong>'+item[0]+'</strong> <span style="color:#999;">('+formatMetricValue(item[1])+')</span></li>';
                 }
                 html += '</ol></div>';
             }
@@ -1931,7 +2106,7 @@ class ScrobblesAnalyzer:
             if (tal.length>0){
                 html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #667eea; border-radius:4px;"><strong style="color:#667eea;">TOP '+n_items+' ALBUMES</strong><ol style="margin:8px 0 0 20px;">';
                 for (let item of tal){
-                    html += '<li><strong>'+(item[0][0]||'')+' — '+(item[0][1]||'')+' </strong><span style="color:#999;">('+item[1]+' escuchas)</span></li>';
+                    html += '<li><strong>'+(item[0][0]||'')+' — '+(item[0][1]||'')+' </strong><span style="color:#999;">('+formatMetricValue(item[1])+')</span></li>';
                 }
                 html += '</ol></div>';
             }
@@ -1939,12 +2114,12 @@ class ScrobblesAnalyzer:
             // Top days
             const td = summary.top_days||[];
             if (td.length>0){
-                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #764ba2; border-radius:4px;"><strong style="color:#764ba2;">TOP '+n_days+' DIAS CON MAS ESCUCHAS</strong><ol style="margin:8px 0 0 20px;">';
+                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #764ba2; border-radius:4px;"><strong style="color:#764ba2;">TOP '+n_days+' DIAS CON MAS '+(currentMetric === 'time' ? 'TIEMPO' : 'ESCUCHAS')+'</strong><ol style="margin:8px 0 0 20px;">';
                 for (let item of td){
                     const day = item[0];
                     const plays = item[1];
                     const m = (summary.top_days_most_played||{})[day]||{};
-                    html += '<li><strong>'+day+'</strong> — <strong style="color:#667eea;">'+plays+'</strong> escuchas';
+                    html += '<li><strong>'+day+'</strong> — <strong style="color:#667eea;">'+formatMetricValue(plays)+'</strong>';
                     if (m[1]) html += ' — <em>'+(m[0]||'')+' — '+(m[1]||'')+' ('+m[2]+')</em>';
                     html += '</li>';
                 }
@@ -1954,13 +2129,13 @@ class ScrobblesAnalyzer:
             // Top tracks by peak plays
             const ttp = summary.top_tracks_peak_plays||[];
             if (ttp.length>0){
-                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #667eea; border-radius:4px;"><strong style="color:#667eea;">TOP '+n_peak+' PICOS DE ESCUCHAS (1 DIA)</strong><ol style="margin:8px 0 0 20px;">';
+                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #667eea; border-radius:4px;"><strong style="color:#667eea;">TOP '+n_peak+' PICOS DIARIOS · '+(currentMetric === 'time' ? 'TIEMPO' : 'ESCUCHAS')+'</strong><ol style="margin:8px 0 0 20px;">';
                 for (let item of ttp){
                     const artist = item[0][0]||'';
                     const track = item[0][1]||'';
                     const peakPlays = item[1]||0;
                     const peakDay = item[2]||'';
-                    html += '<li><strong style="font-size:1.05em; color:#333;">'+track+'</strong><br/><small style="color:#999;">por '+artist+'</small> <span style="color:#999;">('+peakPlays+' en '+peakDay+')</span></li>';
+                    html += '<li><strong style="font-size:1.05em; color:#333;">'+track+'</strong><br/><small style="color:#999;">por '+artist+'</small> <span style="color:#999;">('+formatMetricValue(peakPlays)+' en '+peakDay+')</span></li>';
                 }
                 html += '</ol></div>';
             }
@@ -2008,6 +2183,17 @@ class ScrobblesAnalyzer:
                 }
                 html += '</ol></div>';
             }
+
+            const regularity = summary.top_tracks_regularity||[];
+            if (regularity.length>0){
+                html += '<div style="margin-bottom:16px; padding:12px; background:#f9f9f9; border-left:4px solid #2f855a; border-radius:4px;"><strong style="color:#2f855a;">CANCIONES MAS REGULARES</strong><ol style="margin:8px 0 0 20px;">';
+                for (const item of regularity){
+                    const artist = item[0][0]||'';
+                    const track = item[0][1]||'';
+                    html += '<li><strong>'+track+'</strong><br/><small>por '+artist+' · '+item[1]+'/100 · '+item[2]+' de '+item[3]+' días · '+item[4]+' escuchas</small></li>';
+                }
+                html += '</ol></div>';
+            }
             
             html += '</div>';
             document.getElementById('summary-container').innerHTML = html;
@@ -2015,37 +2201,57 @@ class ScrobblesAnalyzer:
             renderCalendarForYearSimple((summary._config && summary._config.split_by_year) ? currentYear : null);
         }
 
+        function renderCurrentView(){
+            const globalSummary = currentMetric === 'time' ? summaryTimeData : summaryData;
+            const yearlySummaries = currentMetric === 'time' ? summaryByYearTime : summaryByYear;
+            const selectedSummary = currentYear === null ? globalSummary : yearlySummaries[String(currentYear)];
+            renderFullPage(selectedSummary || globalSummary);
+        }
+
         function renderSummary(summary){
             if (!summary) return;
-            const splitEnabled = (summary._config && summary._config.split_by_year);
-            if (splitEnabled){
-                // Prefer summaryByYear if available, otherwise fall back to trackByYear keys
-                const dataByYear = summaryByYear || {};
-                let years = Object.keys(dataByYear).map(k=>parseInt(k)).filter(n=>!isNaN(n)).sort((a,b)=>b-a);
-                if (years.length === 0) {
-                    years = Object.keys(trackByYear || {}).map(k=>parseInt(k)).filter(n=>!isNaN(n)).sort((a,b)=>b-a);
-                }
-                if (years.length === 0) return;
+            const config = summary._config || {};
+            const controls = document.createElement('div');
+            controls.id = 'viewControls';
+            controls.style = 'display:flex;justify-content:center;gap:18px;flex-wrap:wrap;margin-bottom:18px;color:white;';
 
-                let existing = document.getElementById('yearSelector'); if (existing) existing.remove();
-                const selector = document.createElement('div'); selector.id='yearSelector'; selector.style='text-align:center;margin-bottom:18px;color:white;'; selector.innerHTML = '<label style="font-weight:bold;margin-right:8px;color:white;">Selecciona año:</label>';
-                const sel = document.createElement('select'); sel.id='yearSelect'; sel.style='padding:6px 12px;background:#667eea;color:white;border:none;border-radius:4px;cursor:pointer;';
-                for (let y of years){ const opt=document.createElement('option'); opt.value=String(y); opt.text=String(y); sel.appendChild(opt); }
-                currentYear = years[0];
-                sel.onchange = function(){ currentYear = parseInt(this.value); const ys = (summaryByYear || {})[String(currentYear)]; 
-                    if (ys) { 
-                        summaryData = ys; renderFullPage(summaryData); 
-                    } else { 
-                        if (summary._config) { summaryData = summary; summaryData._currentYear = currentYear; renderFullPage(summaryData); } 
-                        renderCalendarForYearSimple(currentYear); 
-                    } 
-                };
-                selector.appendChild(sel);
-                const header = document.querySelector('.header'); if (header) header.parentNode.insertBefore(selector, header.nextSibling);
-                sel.value = String(currentYear);
-                const ys = (summaryByYear || {})[String(currentYear)];
-                if (ys) { summaryData = ys; renderFullPage(summaryData); } else { summaryData = summary; renderFullPage(summaryData); renderCalendarForYearSimple(currentYear); }
-            } else { currentYear = null; renderFullPage(summary); }
+            const metricLabel = document.createElement('label');
+            metricLabel.textContent = 'Métrica ';
+            const metricSelect = document.createElement('select');
+            metricSelect.id = 'metricSelect';
+            metricSelect.innerHTML = '<option value="plays">Número de escuchas</option><option value="time">Tiempo estimado</option>';
+            metricSelect.value = currentMetric;
+            metricSelect.onchange = function(){ currentMetric = this.value; renderCurrentView(); };
+            metricLabel.appendChild(metricSelect);
+            controls.appendChild(metricLabel);
+
+            if (config.split_by_year){
+                const yearLabel = document.createElement('label');
+                yearLabel.textContent = 'Período ';
+                const yearSelect = document.createElement('select');
+                yearSelect.id = 'yearSelect';
+                yearSelect.innerHTML = '<option value="all">Todos los años</option>';
+                const years = Array.from(new Set([
+                    ...Object.keys(summaryByYear || {}),
+                    ...Object.keys(summaryByYearTime || {}),
+                    ...Object.keys(trackByYear || {})
+                ])).sort((a,b)=>Number(b)-Number(a));
+                for (const year of years){
+                    const option = document.createElement('option');
+                    option.value = year;
+                    option.textContent = year;
+                    yearSelect.appendChild(option);
+                }
+                yearSelect.value = 'all';
+                yearSelect.onchange = function(){ currentYear = this.value === 'all' ? null : this.value; renderCurrentView(); };
+                yearLabel.appendChild(yearSelect);
+                controls.appendChild(yearLabel);
+            }
+
+            const header = document.querySelector('.header');
+            if (header) header.parentNode.insertBefore(controls, header.nextSibling);
+            currentYear = null;
+            renderCurrentView();
         }
 
         // Inicialización
