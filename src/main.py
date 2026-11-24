@@ -254,7 +254,7 @@ def select_include_time_stats() -> bool:
 
 def calculate_summary_for_scrobbles(
     scrobbles: List[Scrobble], n_items: int, n_days: int, n_peak_plays: int,
-    max_gap_hours: int = 48, interval_mode: str = "gap"
+    max_gap_hours: int = 48, interval_mode: str = "gap", staleness_min_plays: int = 1
 ) -> Dict[str, Any]:
     """
     Calcula un resumen de estadísticas para un conjunto de scrobbles.
@@ -315,6 +315,14 @@ def calculate_summary_for_scrobbles(
         scrobbles, n=n_days, max_gap_hours=max_gap_hours, interval_mode=interval_mode
     ) or []
 
+    staleness = ScrobblesAnalyzer.get_top_tracks_by_staleness(scrobbles, n=n_items, min_plays=staleness_min_plays)
+    regularity = ScrobblesAnalyzer.get_top_tracks_by_regularity(scrobbles, n=n_items)
+    top_tracks_heatmap = ScrobblesAnalyzer.get_track_monthly_heatmap(
+        scrobbles,
+        [item[0] for item in top_tracks[:n_items]],
+        metric="plays",
+    )
+
     return {
         "top_tracks": top_tracks,
         "track_peaks": track_peaks,
@@ -327,13 +335,17 @@ def calculate_summary_for_scrobbles(
         "top_days": top_days,
         "top_days_most_played": top_days_most_played,
         "top_tracks_peak_plays": top_tracks_peak_plays,
-        "top_tracks_regularity": ScrobblesAnalyzer.get_top_tracks_by_regularity(scrobbles, n=n_items),
+        "top_tracks_regularity": regularity,
+        "top_tracks_recency": ScrobblesAnalyzer.get_top_tracks_by_recentness(scrobbles, n=n_items),
+        "top_tracks_staleness": staleness,
+        "top_tracks_heatmap": top_tracks_heatmap,
     }
 
 
 def calculate_summary_for_scrobbles_by_time(
     scrobbles: List[Scrobble], n_items: int, n_days: int, n_peak_plays: int,
-    fetch_duration_data: bool = False, max_gap_hours: int = 48, interval_mode: str = "gap"
+    fetch_duration_data: bool = False, max_gap_hours: int = 48, interval_mode: str = "gap",
+    staleness_min_plays: int = 1
 ) -> Dict[str, Any]:
     """
     Calcula un resumen de estadísticas por tiempo total para un conjunto de scrobbles.
@@ -407,6 +419,14 @@ def calculate_summary_for_scrobbles_by_time(
         scrobbles, n=n_days, max_gap_hours=max_gap_hours, interval_mode=interval_mode
     ) or []
 
+    staleness = ScrobblesAnalyzer.get_top_tracks_by_staleness(scrobbles, n=n_items, min_plays=staleness_min_plays)
+    regularity = ScrobblesAnalyzer.get_top_tracks_by_regularity(scrobbles, n=n_items)
+    top_tracks_heatmap = ScrobblesAnalyzer.get_track_monthly_heatmap(
+        scrobbles,
+        [item[0] for item in top_tracks[:n_items]],
+        metric="time",
+    )
+
     return {
         "top_tracks": top_tracks,
         "track_peaks": track_peaks,
@@ -421,23 +441,30 @@ def calculate_summary_for_scrobbles_by_time(
         "top_days": top_days,
         "top_days_most_played": top_days_most_played,
         "top_tracks_peak_plays": top_tracks_peak_plays,
-        "top_tracks_regularity": ScrobblesAnalyzer.get_top_tracks_by_regularity(scrobbles, n=n_items),
+        "top_tracks_regularity": regularity,
+        "top_tracks_recency": ScrobblesAnalyzer.get_top_tracks_by_recentness(scrobbles, n=n_items),
+        "top_tracks_staleness": staleness,
+        "top_tracks_heatmap": top_tracks_heatmap,
     }
 
 
 def calculate_complete_summary(
     scrobbles: List[Scrobble], n_items: int, n_days: int, n_peak_plays: int,
-    fetch_duration_data: bool = False, max_gap_hours: int = 48,
-    interval_mode: str = "gap", split_by_year: bool = True
+    fetch_duration_data: bool = True, max_gap_hours: int = 48,
+    interval_mode: str = "gap", split_by_year: bool = True,
+    staleness_min_plays: int = 1
 ) -> Dict[str, Any]:
+    if fetch_duration_data:
+        ScrobblesAnalyzer.reset_duration_api_status()
+
     def calculate(items: List[Scrobble]) -> Dict[str, Any]:
         return {
             "plays": calculate_summary_for_scrobbles(
-                items, n_items, n_days, n_peak_plays, max_gap_hours, interval_mode
+                items, n_items, n_days, n_peak_plays, max_gap_hours, interval_mode, staleness_min_plays
             ),
             "time": calculate_summary_for_scrobbles_by_time(
                 items, n_items, n_days, n_peak_plays, fetch_duration_data,
-                max_gap_hours, interval_mode
+                max_gap_hours, interval_mode, staleness_min_plays
             ),
         }
 
@@ -456,6 +483,7 @@ def calculate_complete_summary(
             for year, items in sorted(scrobbles_by_year.items(), reverse=True)
         }
 
+    real_duration_available = fetch_duration_data and ScrobblesAnalyzer.has_real_duration_data()
     result["_config"] = {
         "n_items": n_items,
         "n_days": n_days,
@@ -465,6 +493,9 @@ def calculate_complete_summary(
         "interval_mode": interval_mode,
         "estimated_duration_seconds": 210,
         "duration_fetch_enabled": fetch_duration_data,
+        "duration_data_source": "lastfm_api" if real_duration_available else "estimated_fallback",
+        "time_view_enabled": real_duration_available,
+        "staleness_min_plays": staleness_min_plays,
     }
     return result
 
@@ -513,7 +544,8 @@ def main():
     print("\n📊 Calculando estadísticas de escuchas, tiempo y regularidad...")
     summary = calculate_complete_summary(
         scrobbles, n_items, n_days, n_peak_plays,
-        max_gap_hours=max_gap_hours, interval_mode=interval_mode
+        max_gap_hours=max_gap_hours, interval_mode=interval_mode,
+        fetch_duration_data=True
     )
 
     print("✓ Estadísticas calculadas")
@@ -526,7 +558,7 @@ def main():
         n_days=n_days,
         n_peak_plays=n_peak_plays,
         split_by_year=True,
-        by_time=False
+        by_time=summary.get('_config', {}).get('duration_data_source') == 'lastfm_api'
     )
     print("✓ Calendario generado: calendar.html")
     

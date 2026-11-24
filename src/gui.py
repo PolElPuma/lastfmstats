@@ -32,9 +32,10 @@ class LastFmStatsApp:
         self.day_count = tk.StringVar(value="10")
         self.peak_count = tk.StringVar(value="10")
         self.streak_gap = tk.StringVar(value="48")
+        self.staleness_min_plays = tk.StringVar(value="1")
         self.streak_mode = tk.StringVar(value="gap")
         self.split_years = tk.BooleanVar(value=True)
-        self.fetch_durations = tk.BooleanVar(value=False)
+        self.fetch_durations = tk.BooleanVar(value=True)
         self.open_browser = tk.BooleanVar(value=True)
         self._build_ui()
 
@@ -67,6 +68,7 @@ class LastFmStatsApp:
             ("Días destacados", self.day_count),
             ("Picos diarios", self.peak_count),
             ("Separación máxima (horas)", self.streak_gap),
+            ("Mín. escuchas para stale", self.staleness_min_plays),
         ]
         for index, (label, variable) in enumerate(fields):
             row, column = divmod(index, 2)
@@ -132,6 +134,7 @@ class LastFmStatsApp:
                 "n_days": int(self.day_count.get()),
                 "n_peak_plays": int(self.peak_count.get()),
                 "max_gap_hours": int(self.streak_gap.get()),
+                "staleness_min_plays": int(self.staleness_min_plays.get()),
             }
             if any(value < 1 for value in settings.values()):
                 raise ValueError("Los valores numéricos deben ser mayores que cero.")
@@ -191,6 +194,7 @@ class LastFmStatsApp:
                 fetch_duration_data=job["fetch_duration_data"],
                 interval_mode=job["interval_mode"],
                 split_by_year=job["split_by_year"],
+                staleness_min_plays=job["staleness_min_plays"],
             )
             output_path = Path(job["output_path"]).expanduser().resolve()
             output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -175,6 +175,165 @@ def test_empty_scrobbles_list():
     assert result2 is None or result2 == {}
 
 
+def test_estimate_track_duration_uses_artist_median_when_missing():
+    """Un track sin duración debe estimarse a partir de la distribución del artista, no con un valor fijo."""
+    from load_scrobbles import _duration_cache
+
+    original_cache = _duration_cache.copy()
+    try:
+        _duration_cache.clear()
+        _duration_cache[('Artist1', 'SongA')] = 120
+        _duration_cache[('Artist1', 'SongB')] = 300
+        _duration_cache[('Artist1', 'SongC')] = 360
+
+        estimated = ScrobblesAnalyzer._estimate_track_duration('Artist1', 'Missing Song', fetch_remote=False)
+        assert estimated == 300
+    finally:
+        _duration_cache.clear()
+        _duration_cache.update(original_cache)
+
+
+def test_regularity_ranks_by_distinct_days_and_span():
+    """La regularidad debe favorecer canciones escuchadas en más días distintos, no solo por un par de días muy repetidos."""
+    base = datetime(2024, 1, 1, 12, 0)
+    items = []
+
+    def add(artist, track, day_offset, times=1):
+        dt = base + timedelta(days=day_offset)
+        for i in range(times):
+            dt_i = dt + timedelta(minutes=i)
+            uts = str(int(dt_i.replace(tzinfo=None).timestamp()))
+            items.append(Scrobble({
+                'date': {'uts': uts, '#text': dt_i.strftime('%d %b %Y, %H:%M')},
+                'artist': {'#text': artist},
+                'album': {'#text': 'Album'},
+                'name': track,
+                'mbid': ''
+            }))
+
+    # SongA: escuchado en 6 días distintos durante varias semanas
+    for day in [0, 7, 14, 21, 28, 35]:
+        add('ArtistX', 'SongA', day)
+
+    # SongB: escuchado solo en 2 días, aunque varias veces cada uno
+    for day in [0, 0, 0, 0, 30, 30, 30]:
+        add('ArtistX', 'SongB', day)
+
+    regularity = ScrobblesAnalyzer.get_top_tracks_by_regularity(items, n=2)
+    assert regularity[0][0][1] == 'SongA'
+    assert regularity[0][2] >= regularity[1][2]
+
+
+def test_api_deduplicates_repeated_scrobbles():
+    """La importación desde la API no debe duplicar scrobbles ya presentes en caché."""
+    loader = ScrobblesLoader('data')
+    repeated = [
+        {'date': {'uts': '1700000000', '#text': '01 Jan 2024, 12:00'}, 'artist': {'#text': 'Mori'}, 'album': {'#text': 'A'}, 'name': 'Lovers to Strangers'},
+        {'date': {'uts': '1700000000', '#text': '01 Jan 2024, 12:00'}, 'artist': {'#text': 'Mori'}, 'album': {'#text': 'A'}, 'name': 'Lovers to Strangers'},
+        {'date': {'uts': '1700000060', '#text': '01 Jan 2024, 12:01'}, 'artist': {'#text': 'Mori'}, 'album': {'#text': 'A'}, 'name': 'Lovers to Strangers'},
+    ]
+
+    deduped = loader._deduplicate_scrobbles_data(repeated)
+    assert len(deduped) == 2
+    assert all(item['date']['uts'] != '1700000000' or item['name'] == 'Lovers to Strangers' for item in deduped)
+
+
+def test_recentness_metric_prioritizes_last_listened_tracks():
+    """La métrica de recencia debe devolver la canción escuchada más recientemente primero."""
+    base = datetime(2024, 1, 1, 12, 0)
+    items = []
+
+    def add(artist, track, days_ago, plays=1):
+        for i in range(plays):
+            dt = base - timedelta(days=days_ago, minutes=i)
+            uts = str(int(dt.replace(tzinfo=None).timestamp()))
+            items.append(Scrobble({
+                'date': {'uts': uts, '#text': dt.strftime('%d %b %Y, %H:%M')},
+                'artist': {'#text': artist},
+                'album': {'#text': 'Album'},
+                'name': track,
+                'mbid': ''
+            }))
+
+    add('ArtistA', 'Fresh Track', 1, plays=5)
+    add('ArtistB', 'Old Track', 45, plays=5)
+
+    recent = ScrobblesAnalyzer.get_top_tracks_by_recentness(items, n=2)
+    assert recent[0][0][1] == 'Fresh Track'
+    assert recent[0][1] < recent[1][1]
+
+
+def test_weekday_affinity_and_monthly_consistency_metrics_are_removed():
+    """Estas métricas ya no forman parte del calendario ni del cálculo activo."""
+    assert not hasattr(ScrobblesAnalyzer, 'get_top_tracks_by_weekday_affinity')
+    assert not hasattr(ScrobblesAnalyzer, 'get_top_tracks_by_monthly_consistency')
+
+
+def test_staleness_threshold_and_heatmap_data():
+    """El ranking de tiempo sin escuchar debe poder filtrar por umbral y producir heatmaps de meses."""
+    base = datetime(2024, 1, 1, 12, 0)
+    items = []
+
+    def add(artist, track, offset_days, plays=1):
+        for i in range(plays):
+            dt = base + timedelta(days=offset_days, hours=i)
+            uts = str(int(dt.replace(tzinfo=None).timestamp()))
+            items.append(Scrobble({
+                'date': {'uts': uts, '#text': dt.strftime('%d %b %Y, %H:%M')},
+                'artist': {'#text': artist},
+                'album': {'#text': 'Album'},
+                'name': track,
+                'mbid': ''
+            }))
+
+    add('ArtistA', 'Long Absent', 180, plays=5)
+    add('ArtistB', 'Older Hit', 10, plays=2)
+    add('ArtistC', 'Noisy Song', 60, plays=1)
+
+    staleness = ScrobblesAnalyzer.get_top_tracks_by_staleness(items, n=3, min_plays=2)
+    heatmap = ScrobblesAnalyzer.get_track_monthly_heatmap(items, [('ArtistA', 'Long Absent'), ('ArtistB', 'Older Hit')])
+
+    assert staleness[0][0][1] == 'Older Hit'
+    assert any(item[0][1] == 'Long Absent' for item in staleness)
+    assert heatmap[0]['track'] == 'Long Absent'
+    assert isinstance(heatmap[0]['series'], list)
+    assert heatmap[0]['series']
+
+
+def test_regularity_score_is_comprehensible_and_staleness_ranks_old_tracks_first():
+    """La regularidad debe usar un coeficiente acotado y el estancamiento debe poner primero las canciones más viejas."""
+    base = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+    items = []
+
+    for i in range(5):
+        ts = base - timedelta(days=i * 2)
+        uts = str(int(ts.replace(tzinfo=None).timestamp()))
+        items.append(Scrobble({
+            'date': {'uts': uts, '#text': ts.strftime('%d %b %Y, %H:%M')},
+            'artist': {'#text': 'ArtistA'},
+            'album': {'#text': 'Album'},
+            'name': 'Regular Song',
+            'mbid': ''
+        }))
+
+    for i in range(2):
+        ts = base - timedelta(days=180 + i)
+        uts = str(int(ts.replace(tzinfo=None).timestamp()))
+        items.append(Scrobble({
+            'date': {'uts': uts, '#text': ts.strftime('%d %b %Y, %H:%M')},
+            'artist': {'#text': 'ArtistB'},
+            'album': {'#text': 'Album'},
+            'name': 'Forgotten Song',
+            'mbid': ''
+        }))
+
+    regularity = ScrobblesAnalyzer.get_top_tracks_by_regularity(items, n=2, min_plays=2)
+    staleness = ScrobblesAnalyzer.get_top_tracks_by_staleness(items, n=2, min_plays=2)
+
+    assert regularity[0][1] <= 10.0
+    assert staleness[0][0][1] == 'Forgotten Song'
+
+
 def test_utc_to_local_accepts_lastfm_and_iso_timestamps():
     lastfm_date = ScrobblesAnalyzer._utc_to_local("01 Feb 2023, 12:00")
     iso_date = ScrobblesAnalyzer._utc_to_local("2023-02-01T12:00:00+00:00")
